@@ -1,3 +1,7 @@
+#if 0 
+hipcc -O3 -DKOMPRESS -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
+exit
+#endif
 // clang-format off
 /*
 mpi_hooks.cpp:
@@ -92,6 +96,15 @@ Status for Vlasiator comms:
 #include <dlfcn.h>
 #include <unordered_map>
 #include "mpi.h"
+
+//Currenlty only HIP and based on https://github.com/ROCm/hipCOMP-core/blob/main/tests/test_lz4.cpp 
+#ifdef KOMPRESS
+#include "hipcomp.hpp"
+#include "hipcomp/lz4.hpp"
+using namespace hipcomp;
+#endif
+
+
 #if defined(USE_HIP) || defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #define gpuMalloc(ptr, size) hipMalloc(ptr, size)
@@ -167,6 +180,7 @@ struct BumpAllocator {
     std::size_t base = (std::size_t)((char *)mem + sp);
     std::size_t pad = (base % al == 0) ? 0 : (al - (base % al));
     if (sp + pad + need > cap) {
+      FATAL("MPI_Pancake::OOM");
       return nullptr;
     }
     void *p = (char *)mem + sp + pad;
@@ -176,15 +190,54 @@ struct BumpAllocator {
   //realloc esssentially?
   template <class T> void unsafe_extend_allocation(std::size_t extraElems) {
     std::size_t extra = extraElems * sizeof(T);
-#ifdef DEBUG_HOOKS
     if (sp + extra > cap) {
-      MPI_Abort(MPI_COMM_WORLD, -1);
+      FATAL("F around Find out");
     };
-#endif
     sp += extra;
   }
   void release() { sp = 0; }
 };
+
+#ifdef KOMPRESS
+//Kompression stuff
+inline std::size_t estimate_bytes_z(std::size_t input_bytes,
+                               hipStream_t stream,
+                               std::size_t chunk_size = (1u << 16)){
+  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
+  return manager.configure_compression(input_bytes).max_compressed_buffer_size;
+}
+
+inline std::size_t estimate_bytes_d(const uint8_t* d_comp,
+                               hipStream_t stream,
+                               std::size_t chunk_size = (1u << 16)){
+  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
+  return manager.configure_decompression(const_cast<uint8_t*>(d_comp)).decomp_data_size;
+}
+
+inline std::size_t compress_into(const uint8_t* d_in,
+                                 uint8_t* d_comp,
+                                 std::size_t input_bytes,
+                                 hipStream_t stream,
+                                 std::size_t chunk_size = (1u << 16)){
+  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
+  auto cfg = manager.configure_compression(input_bytes);
+  manager.compress(d_in, d_comp, cfg);
+  hipStreamSynchronize(stream);
+  return manager.get_compressed_output_size(d_comp);
+}
+
+inline std::size_t decompress_into(const uint8_t* d_comp,
+                                   uint8_t* d_out,
+                                   hipStream_t stream,
+                                   std::size_t chunk_size = (1u << 16)){
+  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
+  auto dcfg = manager.configure_decompression(const_cast<uint8_t*>(d_comp));
+  manager.decompress(d_out, const_cast<uint8_t*>(d_comp), dcfg);
+  hipStreamSynchronize(stream);
+  return dcfg.decomp_data_size;
+}
+
+#endif //KOMPRESS
 
 struct SOABlock {
   MPI_Aint disp;
@@ -212,6 +265,10 @@ struct Pending {
   void *user_buf = nullptr;
   int count = 0;
   MPI_Comm comm{};
+#ifdef KOMPRESS
+  std::size_t comp_bytes = 0;
+  char *d_comp_pack_buffer = nullptr;
+#endif
   struct Header {
     int nseg;
     std::size_t total_bytes;
@@ -543,6 +600,17 @@ static void cpu_unpack(void *user_buf, int count, Pending *p) {
 static void gpu_pack(const void *user_buf, int count, Pending *p) {
   p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
   do_pack((const char *)user_buf, count, p, s);
+#ifdef KOMPRESS
+  std::size_t cap = estimate_bytes_z(p->pack_size, s);
+  auto *d_comp = dev_arena->allocate<uint8_t>(cap, 256);
+  const std::size_t comp_bytes =
+      compress_into(reinterpret_cast<const uint8_t *>(p->d_pack_buffer), d_comp,
+                    p->pack_size, s);
+  p->d_comp_pack_buffer = reinterpret_cast<char *>(d_comp);
+  p->comp_bytes = comp_bytes;
+  // fprintf(stderr,"Compression of %f x
+  // \n",(float)p->pack_size/(float)comp_bytes);
+#endif
   gpuStreamSynchronize(s);
 }
 
@@ -556,6 +624,16 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
     if (is_device_ptr(p->user_buf)) {
+#ifdef KOMPRESS
+      p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
+      const std::size_t decomp_bytes = decompress_into(
+          reinterpret_cast<const uint8_t *>(p->d_comp_pack_buffer),
+          reinterpret_cast<uint8_t *>(p->d_pack_buffer), s);
+      if (decomp_bytes != p->pack_size) {
+        FATAL("Decompressed size (%zu) VS wanted size (%zu).", decomp_bytes,
+              p->pack_size);
+      }
+#endif
       gpu_unpack(p->user_buf, p->count, p);
     } else {
       cpu_unpack(p->user_buf, p->count, p);
@@ -609,10 +687,16 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 
     int ret = MPI_SUCCESS;
     if (is_device_ptr(buf)) {
-      LOG("CUDA-aware SEND (device)");
-      gpu_pack(buf, count, p);
+      LOG("Dev SEND");
+      gpu_pack(buf, count, p); //<== look inside it kompresses
+#ifdef KOMPRESS
+      ret = rMPI_Isend(p->d_comp_pack_buffer, (int)p->comp_bytes, MPI_BYTE,
+                       dest, tag, comm, &p->rreq);
+
+#else
       ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
+#endif
     } else {
       LOG("Host SEND");
       cpu_pack(buf, count, p);
@@ -650,10 +734,18 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     build_lookaside(p);
     int ret = MPI_SUCCESS;
     if (is_device_ptr(buf)) {
-      LOG("CUDA-aware RECV (device)");
+      LOG("Dev RECV");
+#ifdef KOMPRESS
+      //Worst case scenario
+      const std::size_t max_comp_size = estimate_bytes_z(p->pack_size, s);
+      p->d_comp_pack_buffer = dev_arena->allocate<char>(max_comp_size, 256);
+      ret = rMPI_Irecv(p->d_comp_pack_buffer, (int)max_comp_size, MPI_BYTE, src,
+                       tag, comm, &p->rreq);
+#else
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
       ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
                        comm, &p->rreq);
+#endif
     } else {
       LOG("Host RECV");
       p->stage = host_arena->allocate<char>(p->pack_size, 16);
@@ -687,7 +779,7 @@ int MPI_Wait(MPI_Request *req, MPI_Status *st) {
 //   }
 //   return err;
 // }
-
+//
 int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
   init();
   struct Comm {
@@ -717,7 +809,17 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
         pending.erase(it);
         continue;
       }
+#ifdef KOMPRESS
+      if (p->op == Pending::RECV) {
+        int got = 0;
+        MPI_Get_count(&st, MPI_BYTE, &got);
+        p->comp_bytes = (std::size_t)got;
+      }
+#endif
       do_complete(p, const_cast<MPI_Status *>(&st));
+    } else {
+      //for MPI_IGNORES which have no stats
+      do_complete(p, nullptr);
     }
     pending.erase(it);
     reqs[e.id] = MPI_REQUEST_NULL;
