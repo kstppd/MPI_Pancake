@@ -9,6 +9,7 @@ exit
 #include <stdio.h>
 #include <stdlib.h>
 #include <cstdint>
+#include <math.h>
 
 #ifndef HOP_TARGET_CUDA
 #include <hip/hip_runtime.h>
@@ -36,7 +37,7 @@ extern "C" {
   void fill(double* buf, double value, size_t rows, size_t cols);
 }
 
-#define NITER 10
+#define NITER 100
 const size_t gpu_blocksize = 512;
 
 #define HIP_ERRCHK(result) hip_errchk(result, __FILE__, __LINE__)
@@ -443,6 +444,119 @@ double pingpong_struct_mpi_byte_synchr(int rank, size_t N) {
 
 }
 
+double pingpong_hindexed_bytes(int rank, int N, size_t whitespace_ratio, bool synch) {
+
+  double* data_d;
+  double* data_h;
+  hipHostMalloc((void**)&data_h, sizeof(double)*N);
+  for(size_t k = 0; k<N; ++k) data_h[k] = sin(6*100.0*((double)k)/((double)N));
+
+  HIP_ERRCHK(hipMalloc((void**)&data_d, sizeof(double)*N));
+  HIP_ERRCHK(hipMemcpy(data_d, data_h, sizeof(double)*N, hipMemcpyDefault));
+
+  /* uint8_t* data_d = (uint8_t*)f_data_d; */
+
+// data_d
+//|----------------------------------------------|
+//|#####------####------####------####------####-|
+// ^ pick these ^       ^         ^
+// 4, 6 ,4, 6, 4, 6
+  
+  constexpr size_t partitions = 1<<8;
+  size_t partition_size = sizeof(double)*N/partitions;
+  size_t whitespace_size = partition_size/whitespace_ratio;
+  size_t blocksize = partition_size - whitespace_size;
+    
+
+  MPI_Aint displ[partitions];
+  int blens[partitions];
+  for (size_t i = 0; i < partitions; ++i) {
+    displ[i] = i*partition_size;
+    blens[i] = blocksize + i % 2;
+  }
+
+  MPI_Datatype hindexed_bytes, s_hindexed_bytes;
+  MPI_Type_create_hindexed(partitions, blens, displ, MPI_BYTE, &hindexed_bytes);
+  MPI_Type_commit(&hindexed_bytes);
+
+  MPI_Aint s_displ[1] = {0};
+  int s_blen[1]; s_blen[0] = 1;
+  const MPI_Datatype s_oldtypes[1] = {hindexed_bytes};
+
+  MPI_Type_create_struct(1, s_blen, s_displ, s_oldtypes, &s_hindexed_bytes);
+  MPI_Type_commit(&s_hindexed_bytes);
+
+
+  double t1, t2;
+  MPI_Request req;
+  MPI_Status stat;
+
+  // the warmup
+  if(rank==0) {
+    if (synch) {
+      MPI_Send((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD);
+      MPI_Recv((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    } else {
+      MPI_Isend((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, &req);
+      MPI_Wait(&req, &stat);
+
+      MPI_Irecv((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, &req);
+      MPI_Wait(&req, &stat);
+    }
+
+  }
+
+  if(rank==1) {
+    if (synch) {
+      MPI_Recv((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Send((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD);
+    } else {
+      MPI_Irecv((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, &req);
+      MPI_Wait(&req, &stat);
+      MPI_Isend((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, &req);
+      MPI_Wait(&req, &stat);
+    }
+  }
+
+  // the timing
+  MPI_Barrier(MPI_COMM_WORLD);
+  t1 = MPI_Wtime();
+  for (size_t iter = 0; iter < NITER; ++iter) {
+    if(rank==0) {
+      if (synch) {
+        MPI_Send((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD);
+        MPI_Recv((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      } else {
+        MPI_Isend((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, &req);
+        MPI_Wait(&req, &stat);
+
+        MPI_Irecv((void*)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD, &req);
+        MPI_Wait(&req, &stat);
+      }
+    }
+
+    if(rank==1) {
+      if (synch) {
+        MPI_Recv((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Send((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD);
+      } else {
+        MPI_Irecv((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, &req);
+        MPI_Wait(&req, &stat);
+        MPI_Isend((void*)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD, &req);
+        MPI_Wait(&req, &stat);
+      }
+    }
+
+  }
+  t2 = MPI_Wtime();
+  MPI_Type_free(&hindexed_bytes);
+  MPI_Type_free(&s_hindexed_bytes);
+  HIP_ERRCHK(hipFree(data_d));
+  HIP_ERRCHK(hipHostFree(data_h));
+  return (t2-t1)/NITER;
+  
+}
+
 int main(int argc, char *argv[]) {
 
     int rank, size;
@@ -476,20 +590,22 @@ int main(int argc, char *argv[]) {
 
     hipMalloc((void**) &matrix, sizeof(double)*NCOLS*NROWS);
 
-    if(rank==0) printf("N, time (ms)");
+    if(rank==0) printf("bytes transferred (kB), pancaked (ms), non-pancaked (ms)\n");
 
     // TODO: Do something to the data in rank 1 and test that result is correct
-    for (size_t N = 1<<20; N< 1<<25; N=N<<1) {
+    for (int N = 1<<14; N< 1<<26; N=N<<1) {
 
       /* dt_derived = pingpong_derived(rank, matrix, NROWS*NCOLS, NROWS, NCOLS, BLOCKSIZE, checksum_derived); */
       /* dt_manual = pingpong_gpu_manual(rank, matrix, NROWS*NCOLS, NROWS, NCOLS, BLOCKSIZE, checksum_manual); */
-      dt_struct_async = pingpong_struct_mpi_byte(rank, N);
-      dt_struct_sync = pingpong_struct_mpi_byte_synchr(rank, N);
+      dt_struct_async = pingpong_hindexed_bytes(rank, N, 5, false);
+      dt_struct_sync = pingpong_hindexed_bytes(rank, N, 5, true);
+      /* dt_struct_sync = pingpong_struct_mpi_byte_synchr(rank, N); */
 
 
       /* size_t msg_size = sizeof(double)*NCOLS*(BLOCKSIZE); */
       if (rank == 0) {
-      printf("%zu, %g, %g\n", N, dt_struct_async*1000, dt_struct_sync*1000);
+        printf("%g, %g, %g\n", sizeof(double)*((double)N)/(5.0+1.0)/1e3, dt_struct_async*1000, dt_struct_sync*1000);
+      /* printf("%zu, %g\n", N, dt_struct_async*1000); */
       }
     }
     hipFree(matrix);
