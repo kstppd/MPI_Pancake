@@ -1,206 +1,218 @@
-#define CATCH_CONFIG_RUNNER
-#define CATCH_CONFIG_NO_POSIX_SIGNALS
-#include "catch.hpp"
-#include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <math.h>
 #include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #define gpuError_t hipError_t
+#define gpuStream_t hipStream_t
 #define gpuSuccess hipSuccess
 #define gpuMemcpyDefault hipMemcpyDefault
-#define gpuMalloc hipMalloc
-#define gpuFree hipFree
-#define gpuHostMalloc hipHostMalloc
-#define gpuHostFree hipHostFree
-#define gpuMemcpy hipMemcpy
-#define gpuDeviceSynchronize hipDeviceSynchronize
+#define gpuMalloc(ptr, size) hipMalloc(ptr, size)
+#define gpuFree(ptr) hipFree(ptr)
+#define gpuHostMalloc(ptr, size) hipHostMalloc(ptr, size)
+#define gpuHostFree(ptr) hipHostFree(ptr)
+#define gpuMemcpy(dst, src, sz, k) hipMemcpy(dst, src, sz, k)
+#define gpuDeviceSynchronize() hipDeviceSynchronize()
 #define gpuGetDeviceCount hipGetDeviceCount
 #define gpuSetDevice hipSetDevice
 #define gpuGetErrorString hipGetErrorString
 #else
 #include <cuda_runtime.h>
 #define gpuError_t cudaError_t
+#define gpuStream_t cudaStream_t
 #define gpuSuccess cudaSuccess
 #define gpuMemcpyDefault cudaMemcpyDefault
-#define gpuMalloc cudaMalloc
-#define gpuFree cudaFree
-#define gpuHostMalloc cudaMallocHost
-#define gpuHostFree cudaFreeHost
-#define gpuMemcpy cudaMemcpy
-#define gpuDeviceSynchronize cudaDeviceSynchronize
+#define gpuMalloc(ptr, size) cudaMalloc(ptr, size)
+#define gpuFree(ptr) cudaFree(ptr)
+#define gpuHostMalloc(ptr, size) cudaMallocHost(ptr, size)
+#define gpuHostFree(ptr) cudaFreeHost(ptr)
+#define gpuMemcpy(dst, src, sz, k) cudaMemcpy(dst, src, sz, k)
+#define gpuDeviceSynchronize() cudaDeviceSynchronize()
 #define gpuGetDeviceCount cudaGetDeviceCount
 #define gpuSetDevice cudaSetDevice
 #define gpuGetErrorString cudaGetErrorString
 #endif
 
-static inline void gpu_errchk(gpuError_t r, const char *f, int l) {
-  if (r != gpuSuccess) {
-    std::fprintf(stderr, "GPU error: %s at %s:%d\n", gpuGetErrorString(r), f,
-                 l);
-    std::fflush(stderr);
-    std::exit(EXIT_FAILURE);
+#define GPU_ERRCHK(result) gpu_errchk(result, __FILE__, __LINE__)
+static inline void gpu_errchk(gpuError_t result, const char *file,
+                              int32_t line) {
+  if (result != gpuSuccess) {
+    printf("\n\n%s in %s at line %d\n", gpuGetErrorString(result), file, line);
+    exit(EXIT_FAILURE);
   }
 }
-#define GPU_ERRCHK(x) gpu_errchk((x), __FILE__, __LINE__)
 
-static bool hindexed_pingpong_roundtrip_ok(size_t N_doubles,
-                                           size_t whitespace_ratio,
-                                           bool sync_mode) {
-  int rank;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#define NITER 100
 
-  double *h_init = nullptr;
-  double *h_back = nullptr;
-  GPU_ERRCHK(gpuHostMalloc((void **)&h_init, sizeof(double) * N_doubles));
-  GPU_ERRCHK(gpuHostMalloc((void **)&h_back, sizeof(double) * N_doubles));
+double pingpong_hindexed_bytes(int rank, int N, size_t whitespace_ratio,
+                               bool synch, double *out_max_abs_err) {
+  double *data_d;
+  double *data_after;
+  GPU_ERRCHK(gpuHostMalloc((void **)&data_after, sizeof(double) * N));
 
-  for (size_t k = 0; k < N_doubles; ++k) {
-    h_init[k] = std::sin(600.0 * double(k) / double(N_doubles));
+  double *data_init;
+  GPU_ERRCHK(gpuHostMalloc((void **)&data_init, sizeof(double) * N));
+  for (size_t k = 0; k < (size_t)N; ++k) {
+    data_init[k] = sin(6 * 100.0 * ((double)k) / ((double)N));
   }
-
-  double *d_buf = nullptr;
-  GPU_ERRCHK(gpuMalloc((void **)&d_buf, sizeof(double) * N_doubles));
+  GPU_ERRCHK(gpuMalloc((void **)&data_d, sizeof(double) * N));
   GPU_ERRCHK(
-      gpuMemcpy(d_buf, h_init, sizeof(double) * N_doubles, gpuMemcpyDefault));
-  GPU_ERRCHK(gpuDeviceSynchronize());
+      gpuMemcpy(data_d, data_init, sizeof(double) * N, gpuMemcpyDefault));
 
-  constexpr size_t partitions = 1u << 8; // 256
-  const size_t total_bytes = sizeof(double) * N_doubles;
-  const size_t part_bytes =
-      (partitions == 0) ? total_bytes : (total_bytes / partitions);
-  const size_t whitespace =
-      (whitespace_ratio == 0) ? 0 : (part_bytes / whitespace_ratio);
-  const size_t block_bytes =
-      (part_bytes > whitespace) ? (part_bytes - whitespace) : 0;
+  constexpr size_t partitions = 1 << 8;
+  size_t partition_size = sizeof(double) * (size_t)N / partitions;
+  size_t whitespace_size = partition_size / whitespace_ratio;
+  size_t blocksize = partition_size - whitespace_size;
 
-  std::vector<MPI_Aint> displs(partitions);
-  std::vector<int> blens(partitions);
+  MPI_Aint displ[partitions];
+  int blens[partitions];
   for (size_t i = 0; i < partitions; ++i) {
-    displs[i] = static_cast<MPI_Aint>(i * part_bytes);
-    size_t len = block_bytes + (i & 1u);
-    if (displs[i] + static_cast<MPI_Aint>(len) >
-        static_cast<MPI_Aint>(total_bytes)) {
-      if (static_cast<MPI_Aint>(total_bytes) > displs[i]) {
-        len =
-            static_cast<size_t>(static_cast<MPI_Aint>(total_bytes) - displs[i]);
-      } else {
-        len = 0;
-      }
-    }
-    blens[i] = static_cast<int>(len);
+    displ[i] = (MPI_Aint)(i * partition_size);
+    blens[i] = (int)(blocksize + (i % 2));
   }
 
-  MPI_Datatype hindexed_bytes, wrapped;
-  MPI_Type_create_hindexed(static_cast<int>(partitions), blens.data(),
-                           displs.data(), MPI_BYTE, &hindexed_bytes);
+  MPI_Datatype hindexed_bytes, s_hindexed_bytes;
+  MPI_Type_create_hindexed((int)partitions, blens, displ, MPI_BYTE,
+                           &hindexed_bytes);
   MPI_Type_commit(&hindexed_bytes);
-  const int one = 1;
-  const MPI_Aint zero_disp = 0;
-  MPI_Type_create_struct(one, &one, &zero_disp, &hindexed_bytes, &wrapped);
-  MPI_Type_commit(&wrapped);
 
+  const MPI_Aint s_displ[1] = {0};
+  const int s_blen[1] = {1};
+  const MPI_Datatype s_oldtypes[1] = {hindexed_bytes};
+  MPI_Type_create_struct(1, s_blen, s_displ, s_oldtypes, &s_hindexed_bytes);
+  MPI_Type_commit(&s_hindexed_bytes);
+
+  // Warm-up
   MPI_Request req;
   MPI_Status stat;
   if (rank == 0) {
-    if (sync_mode) {
-      MPI_Send(d_buf, 1, wrapped, 1, 0, MPI_COMM_WORLD);
-      MPI_Recv(d_buf, 1, wrapped, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    if (synch) {
+      MPI_Send((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD);
+      MPI_Recv((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+               MPI_STATUS_IGNORE);
     } else {
-      MPI_Isend(d_buf, 1, wrapped, 1, 0, MPI_COMM_WORLD, &req);
+      MPI_Isend((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+                &req);
       MPI_Wait(&req, &stat);
-      MPI_Irecv(d_buf, 1, wrapped, 1, 0, MPI_COMM_WORLD, &req);
+      MPI_Irecv((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+                &req);
       MPI_Wait(&req, &stat);
     }
   } else if (rank == 1) {
-    if (sync_mode) {
-      MPI_Recv(d_buf, 1, wrapped, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-      MPI_Send(d_buf, 1, wrapped, 0, 0, MPI_COMM_WORLD);
+    if (synch) {
+      MPI_Recv((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+               MPI_STATUS_IGNORE);
+      MPI_Send((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD);
     } else {
-      MPI_Irecv(d_buf, 1, wrapped, 0, 0, MPI_COMM_WORLD, &req);
+      MPI_Irecv((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+                &req);
       MPI_Wait(&req, &stat);
-      MPI_Isend(d_buf, 1, wrapped, 0, 0, MPI_COMM_WORLD, &req);
+      MPI_Isend((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+                &req);
       MPI_Wait(&req, &stat);
     }
   }
 
+  // Timing
+  double t1, t2;
+  MPI_Barrier(MPI_COMM_WORLD);
+  t1 = MPI_Wtime();
+  for (size_t iter = 0; iter < NITER; ++iter) {
+    if (rank == 0) {
+      if (synch) {
+        MPI_Send((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD);
+        MPI_Recv((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+      } else {
+        MPI_Isend((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+                  &req);
+        MPI_Wait(&req, &stat);
+        MPI_Irecv((void *)data_d, 1, s_hindexed_bytes, 1, 0, MPI_COMM_WORLD,
+                  &req);
+        MPI_Wait(&req, &stat);
+      }
+    } else if (rank == 1) {
+      if (synch) {
+        MPI_Recv((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+        MPI_Send((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD);
+      } else {
+        MPI_Irecv((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+                  &req);
+        MPI_Wait(&req, &stat);
+        MPI_Isend((void *)data_d, 1, s_hindexed_bytes, 0, 0, MPI_COMM_WORLD,
+                  &req);
+        MPI_Wait(&req, &stat);
+      }
+    }
+  }
+  t2 = MPI_Wtime();
   GPU_ERRCHK(
-      gpuMemcpy(h_back, d_buf, sizeof(double) * N_doubles, gpuMemcpyDefault));
-  GPU_ERRCHK(gpuDeviceSynchronize());
-
-  bool ok = true;
-  for (size_t i = 0; i < N_doubles; ++i) {
-    if (h_back[i] != h_init[i]) {
-      ok = false;
-      break;
-    }
+      gpuMemcpy(data_after, data_d, sizeof(double) * N, gpuMemcpyDefault));
+  double max_abs_err = 0.0;
+  for (size_t k = 0; k < (size_t)N; ++k) {
+    double ref = sin(6 * 100.0 * ((double)k) / ((double)N));
+    double err = fabs(data_after[k] - ref);
+    if (err > max_abs_err)
+      max_abs_err = err;
   }
+  if (out_max_abs_err)
+    *out_max_abs_err = max_abs_err;
 
-  MPI_Type_free(&wrapped);
   MPI_Type_free(&hindexed_bytes);
-  GPU_ERRCHK(gpuFree(d_buf));
-  GPU_ERRCHK(gpuHostFree(h_back));
-  GPU_ERRCHK(gpuHostFree(h_init));
-  return ok;
+  MPI_Type_free(&s_hindexed_bytes);
+  GPU_ERRCHK(gpuFree(data_d));
+  GPU_ERRCHK(gpuHostFree(data_after));
+  GPU_ERRCHK(gpuHostFree(data_init));
+  return (t2 - t1) / NITER;
 }
 
+int main(int argc, char *argv[]) {
+  int rank, size;
 
-TEST_CASE("COMM_TYPE:: STRUCT HINDEXED MPI_BYTE ") {
-  int world_size = 0, rank = -1;
-  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
-  if (world_size != 2) {
-    if (rank == 0)
-      WARN("Run this test with exactly 2 MPI processes (mpirun -np 2).");
-    SUCCEED(); 
-    return;
-  }
-  const size_t N = 1u << 20; 
-  const size_t whitespace_ratio = 5;
-
-  SECTION("Blocking Send/Recv") {
-    bool ok =
-        hindexed_pingpong_roundtrip_ok(N, whitespace_ratio, /*sync*/ true);
-    REQUIRE(ok);
-  }
-
-  SECTION("Nonblocking Isend/Irecv") {
-    bool ok =
-        hindexed_pingpong_roundtrip_ok(N, whitespace_ratio, /*sync*/ false);
-    REQUIRE(ok);
-  }
-}
-
-int main(int argc, char **argv) {
   MPI_Init(&argc, &argv);
-
-  int rank = 0, size = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  int devcount = 0;
-  GPU_ERRCHK(gpuGetDeviceCount(&devcount));
-  if (devcount > 0) {
-    GPU_ERRCHK(gpuSetDevice(rank % devcount));
-  } else {
+  if (size != 2) {
     if (rank == 0)
-      std::fprintf(stderr, "Warning: no GPU devices visible.\n");
-  }
-
-  Catch::Session session;
-  int result = session.applyCommandLine(argc, argv);
-  if (result != 0) {
+      printf("Run with exactly 2 processes.\n");
     MPI_Finalize();
-    return result;
+    return 0;
   }
 
-  result = session.run();
+  int devcount;
+  GPU_ERRCHK(gpuGetDeviceCount(&devcount));
+  if (rank == 0 || devcount > 1) {
+    if (devcount > 1)
+      GPU_ERRCHK(gpuSetDevice(rank % devcount));
+  }
+  fflush(stdout);
+  if (rank == 0) {
+    printf("bytes transferred (kB), async (ms), sync (ms), async_max_err, "
+           "sync_max_err\n");
+  }
+  for (int N = 1 << 14; N < 1 << 18; N = N << 1) {
+    double err_async = 0.0, err_sync = 0.0;
+    double dt_struct_async =
+        pingpong_hindexed_bytes(rank, N, 5, false, &err_async);
+    double dt_struct_sync =
+        pingpong_hindexed_bytes(rank, N, 5, true, &err_sync);
+    if (rank == 0) {
+      size_t partitions = 1 << 8;
+      size_t partition_size = sizeof(double) * (size_t)N / partitions;
+      size_t whitespace_size = partition_size / 5; // whitespace_ratio = 5
+      size_t blocksize = partition_size - whitespace_size;
+      double effective_bytes = (double)partitions * (blocksize + 0.5);
+      printf("%g, %g, %g, %.3e, %.3e\n", effective_bytes / 1e3,
+             dt_struct_async * 1000.0, dt_struct_sync * 1000.0, err_async,
+             err_sync);
+    }
+  }
 
   MPI_Finalize();
-  return result;
+  return 0;
 }
