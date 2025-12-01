@@ -410,17 +410,19 @@ static void init() {
                                 rMPI_Isend &&
                                 rMPI_Irecv &&
                                 rMPI_Type_get_env &&
-                                rMPI_Type_size
-                                && rMPI_Wait &&
+                                rMPI_Type_size && 
+                                rMPI_Wait &&
                                 rMPI_Waitall &&
                                 rMPI_Finalize;
 
   if (!are_all_hooks_ok){
-    fprintf(stderr, "ERROR:Some hook could not be dlopened!\n");
-    MPI_Abort(MPI_COMM_WORLD, 32);
+    FATAL(stderr, "ERROR:Some hook could not be dlopened!\n");
   }
   host_arena = new BumpAllocator(h, POOL);
   dev_arena = new BumpAllocator(d, POOL);
+  if (!host_arena || !dev_arena) {
+    FATAL("ERROR:host/dev pool pointer alloc failed\n");
+  }
   gpuStreamCreate(&s);
   initialized = true;
   return;
@@ -438,6 +440,7 @@ static int get_combiner(MPI_Datatype t) {
 
 // This is what I ended up doing becasue at times we get MPI_DUP
 //  which underneath is the usual STRUCT->HINDEXED->MPI_BYTE
+// This can get turn into tail recursion hell
 static MPI_Datatype unwrap_datatype(MPI_Datatype t) {
   int ni = 0, na = 0, nt = 0, comb = 0;
   if (rMPI_Type_get_env(t, &ni, &na, &nt, &comb) != MPI_SUCCESS) {
@@ -642,8 +645,9 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
 }
 
 static int complete_request(MPI_Request *req, MPI_Status *st) {
-  if (*req == MPI_REQUEST_NULL)
+  if (*req == MPI_REQUEST_NULL){
     return MPI_SUCCESS;
+  }
   Pending *p = nullptr;
   auto it = pending.find(*req);
   if (it == pending.end()) {
@@ -679,6 +683,9 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 
   if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
+    if (p==nullptr){
+      FATAL("Failed to allocate Pending pointer");
+    }
     p->op = Pending::SEND;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
@@ -850,7 +857,11 @@ int MPI_Finalize(void) {
   init();
   free(host_arena->mem);
   gpuFree(dev_arena->mem);
-  // gpuStreamDestroy(s);
+  delete host_arena;
+  delete dev_arena;
+  host_arena=nullptr;
+  dev_arena=nullptr;
+  gpuStreamDestroy(s);
   return rMPI_Finalize();
 }
 
