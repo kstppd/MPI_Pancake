@@ -288,7 +288,9 @@ static int (*rMPI_Finalize)     (void)                                          
 
 // SETTINGS
 static constexpr std::size_t POOL = 8ull * 1024ull * 1024ull * 1024ull;
+static constexpr std::size_t INIT_MAP_CAPACITY = 1<<12;
 static constexpr std::size_t INIT_BLOCKS = 8 * 512;
+//~SETTINGS
 static BumpAllocator *host_arena = nullptr;
 static BumpAllocator *dev_arena = nullptr;
 static bool initialized = false;
@@ -397,7 +399,7 @@ static void init() {
   void *h = malloc(POOL);
   void *d = nullptr;
   gpuMalloc(&d, POOL);
-  pending.reserve(1<<12);
+  pending.reserve(INIT_MAP_CAPACITY);
   if (!h) {
     FATAL("ERROR:host pool alloc failed\n");
   }
