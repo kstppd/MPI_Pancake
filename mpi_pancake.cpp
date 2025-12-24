@@ -122,6 +122,10 @@ using namespace hipcomp;
 #define gpuStreamCreate hipStreamCreate
 #define gpuStreamDestroy hipStreamDestroy
 #define gpuStreamSynchronize hipStreamSynchronize
+#define gpuGetLastError() hipGetLastError()
+#define gpuGetErrorString(e) hipGetErrorString(e)
+#define gpuSetDevice hipSetDevice
+#define gpuGetDevice hipGetDevice
 #else
 #include <cuda_runtime.h>
 #define gpuMalloc(ptr, size) cudaMalloc(ptr, size)
@@ -139,6 +143,10 @@ using namespace hipcomp;
 #define gpuStreamCreate cudaStreamCreate
 #define gpuStreamDestroy cudaStreamDestroy
 #define gpuStreamSynchronize cudaStreamSynchronize
+#define gpuGetLastError() cudaGetLastError()
+#define gpuGetErrorString(e) cudaGetErrorString(e)
+#define gpuGetDevice cudaGetDevice
+#define gpuSetDevice cudaSetDevice
 #endif
 
 // #define VERBOSE
@@ -294,10 +302,18 @@ static constexpr std::size_t INIT_BLOCKS = 8 * 512;
 static BumpAllocator *host_arena = nullptr;
 static BumpAllocator *dev_arena = nullptr;
 static bool initialized = false;
-static gpuStream_t s;
+static gpuStream_t s = nullptr;
 static std::unordered_map<MPI_Request, Pending *> pending;
 
-
+static inline gpuStream_t get_local_stream() {
+    static thread_local gpuStream_t my_stream = nullptr;
+    if (my_stream == nullptr) {
+        int dev;
+        gpuGetDevice(&dev);
+        gpuStreamCreate(&my_stream);
+    }
+    return my_stream;
+}
 
 __global__ void pack_kernel(const char *__restrict__ src,
                             const int64_t *__restrict__ disp,
@@ -359,7 +375,6 @@ __global__ void unpack_kernel(const char *__restrict__ src,
 }
 
 
-
 void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
@@ -368,6 +383,10 @@ void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   pack_kernel<<<grid, block, 0, s>>>(
       user, p->d_disp, p->d_len, p->d_pref, p->header.nseg,
       p->header.extent, p->header.total_bytes, count, p->d_pack_buffer);
+  const auto e =gpuGetLastError(); 
+  if (e != gpuSuccess) {
+    FATAL("Pack kernel: %s", gpuGetErrorString(e));
+  }
 }
 
 void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
@@ -378,6 +397,10 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   unpack_kernel<<<grid, block, 0, s>>>(
       (const char *)p->d_pack_buffer, p->d_disp, p->d_len, p->d_pref,
       p->header.nseg, p->header.extent, p->header.total_bytes, count, user);
+  const auto e =gpuGetLastError(); 
+  if (e != gpuSuccess) {
+    FATAL("Unpack kernel: %s", gpuGetErrorString(e));
+  }
 }
 
 
@@ -418,7 +441,7 @@ static void init() {
                                 rMPI_Finalize;
 
   if (!are_all_hooks_ok){
-    FATAL(stderr, "ERROR:Some hook could not be dlopened!\n");
+    FATAL("ERROR:Some hook could not be dlopened!\n");
   }
   host_arena = new BumpAllocator(h, POOL);
   dev_arena = new BumpAllocator(d, POOL);
