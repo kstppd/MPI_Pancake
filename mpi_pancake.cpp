@@ -104,9 +104,13 @@ Status for Vlasiator comms:
 using namespace hipcomp;
 #endif
 
+//For quantizing VDFs/ Currentlly assumes VDFs are fp32 (which they are in production runs)
+#define QUANTIZE_VDF_FLAG 42
+#define MINIMUM_SPARSITY_VALUE 1E-17
 
 #if defined(USE_HIP) || defined(__HIPCC__)
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #define gpuMalloc(ptr, size) hipMalloc(ptr, size)
 #define gpuFree(ptr) hipFree(ptr)
 #define gpuMemcpy(dst, src, sz, k) hipMemcpy(dst, src, sz, k)
@@ -128,6 +132,7 @@ using namespace hipcomp;
 #define gpuGetDevice hipGetDevice
 #else
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #define gpuMalloc(ptr, size) cudaMalloc(ptr, size)
 #define gpuFree(ptr) cudaFree(ptr)
 #define gpuMemcpy(dst, src, sz, k) cudaMemcpy(dst, src, sz, k)
@@ -272,6 +277,7 @@ struct Pending {
   char *d_pack_buffer = nullptr;
   void *user_buf = nullptr;
   int count = 0;
+  int tag = -1;
   MPI_Comm comm{};
 #ifdef KOMPRESS
   std::size_t comp_bytes = 0;
@@ -305,15 +311,6 @@ static bool initialized = false;
 static gpuStream_t s = nullptr;
 static std::unordered_map<MPI_Request, Pending *> pending;
 
-static inline gpuStream_t get_local_stream() {
-    static thread_local gpuStream_t my_stream = nullptr;
-    if (my_stream == nullptr) {
-        int dev;
-        gpuGetDevice(&dev);
-        gpuStreamCreate(&my_stream);
-    }
-    return my_stream;
-}
 
 __global__ void pack_kernel(const char *__restrict__ src,
                             const int64_t *__restrict__ disp,
@@ -374,18 +371,93 @@ __global__ void unpack_kernel(const char *__restrict__ src,
   }
 }
 
+// These are only used when the TAG in MPI is QUANTIZE_VDF_FLAG
+__global__ void pack_kernel_quantized(const float *__restrict__ src,
+                      const int64_t *__restrict__ segment_disp_bytes,
+                      const int *__restrict__ segment_len_bytes,
+                      const std::size_t *__restrict__ segment_prefix_bytes,
+                      int num_segments, std::size_t cell_stride_bytes,
+                      std::size_t packed_bytes_per_cell, int num_cells,
+                      __half *__restrict__ dst) {
+  const int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells){
+    return;
+  }
+  const char *cell_src_bytes = (const char *)src + (std::size_t)cell_idx * cell_stride_bytes;
+  const std::size_t half_elems_per_cell = (packed_bytes_per_cell / 2) / sizeof(__half);
+  __half *cell_out = dst + (std::size_t)cell_idx * half_elems_per_cell;
+  for (int seg_idx = blockIdx.x; seg_idx < num_segments; seg_idx += gridDim.x) {
+    const int seg_len_bytes = segment_len_bytes[seg_idx];
+    const std::size_t seg_prefix_bytes = segment_prefix_bytes[seg_idx];
+    const int64_t seg_disp_bytes = segment_disp_bytes[seg_idx];
+    const int float_count = seg_len_bytes / (int)sizeof(float);
+    const float *seg_src =(const float *)(cell_src_bytes + (std::size_t)seg_disp_bytes);
+    __half *seg_out = cell_out + (seg_prefix_bytes / 2) / sizeof(__half);
+    for (int elem = threadIdx.x; elem < float_count; elem += blockDim.x) {
+      const float x = fmaxf(MINIMUM_SPARSITY_VALUE, seg_src[elem]);
+      seg_out[elem] = __float2half_rn(log10f(x));
+    }
+  }
+}
+
+__global__ void unpack_kernel_quantized(const __half *__restrict__ src,
+                        const int64_t *__restrict__ segment_disp_bytes,
+                        const int *__restrict__ segment_len_bytes,
+                        const std::size_t *__restrict__ segment_prefix_bytes,
+                        int num_segments, std::size_t cell_stride_bytes,
+                        std::size_t packed_bytes_per_cell, int num_cells,
+                        float *__restrict__ dst) {
+  const int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells){
+    return;
+  }
+  char *cell_dst_bytes = (char *)dst + (std::size_t)cell_idx * cell_stride_bytes;
+  const std::size_t half_elems_per_cell = (packed_bytes_per_cell / 2) / sizeof(__half);
+  const __half *cell_in = src + (std::size_t)cell_idx * half_elems_per_cell;
+  for (int seg_idx = blockIdx.x; seg_idx < num_segments; seg_idx += gridDim.x) {
+    const int seg_len_bytes = segment_len_bytes[seg_idx];
+    const std::size_t seg_prefix_bytes = segment_prefix_bytes[seg_idx];
+    const int64_t seg_disp_bytes = segment_disp_bytes[seg_idx];
+    const int float_count = seg_len_bytes / (int)sizeof(float);
+    const __half *seg_in = cell_in + (seg_prefix_bytes / 2) / sizeof(__half);
+    float *seg_dst = (float *)(cell_dst_bytes + (std::size_t)seg_disp_bytes);
+    for (int elem = threadIdx.x; elem < float_count; elem += blockDim.x) {
+      seg_dst[elem] = powf(10.0f, __half2float(seg_in[elem]));
+    }
+  }
+}
+
 
 void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
   dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
-  pack_kernel<<<grid, block, 0, s>>>(
-      user, p->d_disp, p->d_len, p->d_pref, p->header.nseg,
-      p->header.extent, p->header.total_bytes, count, p->d_pack_buffer);
-  const auto e =gpuGetLastError(); 
+  const bool quantize = p->tag==QUANTIZE_VDF_FLAG;
+  if (quantize) {
+    __half* dst_half = reinterpret_cast<__half*>(p->d_pack_buffer);
+    pack_kernel_quantized<<<grid, block, 0, s>>>(
+        reinterpret_cast<const float*>(user),
+        p->d_disp, p->d_len, p->d_pref,
+        p->header.nseg,
+        p->header.extent,
+        p->header.total_bytes,
+        count,
+        dst_half);
+  } else {
+    pack_kernel<<<grid, block, 0, s>>>(
+        user, p->d_disp, p->d_len, p->d_pref,
+        p->header.nseg,
+        p->header.extent,
+        p->header.total_bytes,
+        count,
+        p->d_pack_buffer);
+  }
+  const auto e = gpuGetLastError();
   if (e != gpuSuccess) {
-    FATAL("Pack kernel: %s", gpuGetErrorString(e));
+    FATAL("Pack kernel (%s): %s",
+          quantize ? "quantized" : "normal",
+          gpuGetErrorString(e));
   }
 }
 
@@ -394,12 +466,27 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
   dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
-  unpack_kernel<<<grid, block, 0, s>>>(
-      (const char *)p->d_pack_buffer, p->d_disp, p->d_len, p->d_pref,
-      p->header.nseg, p->header.extent, p->header.total_bytes, count, user);
-  const auto e =gpuGetLastError(); 
+  const bool dequantize = p->tag==QUANTIZE_VDF_FLAG;
+  if (dequantize) {
+    unpack_kernel_quantized<<<grid, block, 0, s>>>(
+        reinterpret_cast<const __half*>(p->d_pack_buffer),
+        p->d_disp, p->d_len, p->d_pref,
+        p->header.nseg, p->header.extent,
+        p->header.total_bytes, count,
+        reinterpret_cast<float*>(user));
+  } else {
+    unpack_kernel<<<grid, block, 0, s>>>(
+        (const char*)p->d_pack_buffer,
+        p->d_disp, p->d_len, p->d_pref,
+        p->header.nseg, p->header.extent,
+        p->header.total_bytes, count,
+        user);
+  }
+  const auto e = gpuGetLastError();
   if (e != gpuSuccess) {
-    FATAL("Unpack kernel: %s", gpuGetErrorString(e));
+    FATAL("Unpack kernel (%s): %s",
+          dequantize ? "quantized" : "normal",
+          gpuGetErrorString(e));
   }
 }
 
@@ -712,8 +799,12 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
       FATAL("Failed to allocate Pending pointer");
     }
     p->op = Pending::SEND;
+    p->tag = tag;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
+    if (p->tag==QUANTIZE_VDF_FLAG){
+      p->pack_size/=2;
+    }
 
     build_lookaside(p);
 
@@ -757,11 +848,15 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
   if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     p->op = Pending::RECV;
+    p->tag = tag;
     p->user_buf = buf;
     p->count = count;
     p->comm = comm;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
+    if (p->tag==QUANTIZE_VDF_FLAG){
+      p->pack_size/=2;
+    }
 
     build_lookaside(p);
     int ret = MPI_SUCCESS;
