@@ -96,6 +96,7 @@ Status for Vlasiator comms:
 #include <dlfcn.h>
 #include <unordered_map>
 #include "mpi.h"
+#include <cstdint>
 
 //Currenlty only HIP and based on https://github.com/ROCm/hipCOMP-core/blob/main/tests/test_lz4.cpp 
 #ifdef KOMPRESS
@@ -375,166 +376,207 @@ __global__ void unpack_kernel(const char *__restrict__ src,
   }
 }
 
-__global__ void pack_kernel_qfp16(const float *__restrict__ src,
-                      const int64_t *__restrict__ segment_disp_bytes,
-                      const int *__restrict__ segment_len_bytes,
-                      const std::size_t *__restrict__ segment_prefix_bytes,
-                      int num_segments, std::size_t cell_stride_bytes,
-                      std::size_t packed_bytes_per_cell, int num_cells,
-                      __half *__restrict__ dst) {
+__device__ __forceinline__ uint32_t load_u32_unaligned(const void *p) {
+  const uint8_t *b = (const uint8_t *)p;
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+         ((uint32_t)b[3] << 24);
+}
+
+__device__ __forceinline__ void store_u32_unaligned(void *p, uint32_t u) {
+  uint8_t *b = (uint8_t *)p;
+  b[0] = (uint8_t)(u & 0xFF);
+  b[1] = (uint8_t)((u >> 8) & 0xFF);
+  b[2] = (uint8_t)((u >> 16) & 0xFF);
+  b[3] = (uint8_t)((u >> 24) & 0xFF);
+}
+
+__device__ __forceinline__ float load_f32_unaligned(const void *p) {
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.u = load_u32_unaligned(p);
+  return v.f;
+}
+
+__device__ __forceinline__ void store_f32_unaligned(void *p, float f) {
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.f = f;
+  store_u32_unaligned(p, v.u);
+}
+
+__global__ void
+pack_kernel_qfp16(const float *__restrict__ src,
+                  const int64_t *__restrict__ segment_disp_bytes,
+                  const int *__restrict__ segment_len_bytes,
+                  const std::size_t *__restrict__ segment_prefix_bytes,
+                  int num_segments, std::size_t cell_stride_bytes,
+                  std::size_t packed_bytes_per_cell, int num_cells,
+                  __half *__restrict__ dst) {
   const int cell_idx = blockIdx.y;
   if (cell_idx >= num_cells){
     return;
   }
-  const char *cell_src_bytes = (const char *)src + (std::size_t)cell_idx * cell_stride_bytes;
-  const std::size_t half_elems_per_cell = (packed_bytes_per_cell / 2) / sizeof(__half);
+  const char *cell_src =
+      (const char *)src + (std::size_t)cell_idx * cell_stride_bytes;
+  const std::size_t half_elems_per_cell =
+      (packed_bytes_per_cell / 2) / sizeof(__half);
   __half *cell_out = dst + (std::size_t)cell_idx * half_elems_per_cell;
-  for (int seg_idx = blockIdx.x; seg_idx < num_segments; seg_idx += gridDim.x) {
-    const int seg_len_bytes = segment_len_bytes[seg_idx];
-    const std::size_t seg_prefix_bytes = segment_prefix_bytes[seg_idx];
-    const int64_t seg_disp_bytes = segment_disp_bytes[seg_idx];
-    const int float_count = seg_len_bytes / (int)sizeof(float);
-    const float *seg_src =(const float *)(cell_src_bytes + (std::size_t)seg_disp_bytes);
-    __half *seg_out = cell_out + (seg_prefix_bytes / 2) / sizeof(__half);
-    for (int elem = threadIdx.x; elem < float_count; elem += blockDim.x) {
-      const float x = fmaxf(MINIMUM_SPARSITY_VALUE, seg_src[elem]);
-      seg_out[elem] = __float2half_rn(log10f(x));
+  for (int seg = blockIdx.x; seg < num_segments; seg += gridDim.x) {
+    const int seg_len_b = segment_len_bytes[seg];
+    const std::size_t seg_pref_b = segment_prefix_bytes[seg];
+    const int64_t seg_disp_b = segment_disp_bytes[seg];
+    const int n = seg_len_b / (int)sizeof(float);
+    const char *seg_src = cell_src + (std::size_t)seg_disp_b;
+    __half *seg_out = cell_out + (seg_pref_b / 4);
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      float x = load_f32_unaligned(seg_src + (std::size_t)i * sizeof(float));
+      x = fmaxf(x, (float)MINIMUM_SPARSITY_VALUE);
+      seg_out[i] = __float2half_rn(log10f(x));
     }
   }
 }
 
-__global__ void unpack_kernel_qfp16(const __half *__restrict__ src,
-                        const int64_t *__restrict__ segment_disp_bytes,
-                        const int *__restrict__ segment_len_bytes,
-                        const std::size_t *__restrict__ segment_prefix_bytes,
-                        int num_segments, std::size_t cell_stride_bytes,
-                        std::size_t packed_bytes_per_cell, int num_cells,
-                        float *__restrict__ dst) {
+__global__ void
+unpack_kernel_qfp16(const __half *__restrict__ src,
+                    const int64_t *__restrict__ segment_disp_bytes,
+                    const int *__restrict__ segment_len_bytes,
+                    const std::size_t *__restrict__ segment_prefix_bytes,
+                    int num_segments, std::size_t cell_stride_bytes,
+                    std::size_t packed_bytes_per_cell, int num_cells,
+                    float *__restrict__ dst) {
   const int cell_idx = blockIdx.y;
   if (cell_idx >= num_cells){
     return;
   }
-  char *cell_dst_bytes = (char *)dst + (std::size_t)cell_idx * cell_stride_bytes;
-  const std::size_t half_elems_per_cell = (packed_bytes_per_cell / 2) / sizeof(__half);
+  char *cell_dst = (char *)dst + (std::size_t)cell_idx * cell_stride_bytes;
+  const std::size_t half_elems_per_cell =
+      (packed_bytes_per_cell / 2) / sizeof(__half);
   const __half *cell_in = src + (std::size_t)cell_idx * half_elems_per_cell;
-  for (int seg_idx = blockIdx.x; seg_idx < num_segments; seg_idx += gridDim.x) {
-    const int seg_len_bytes = segment_len_bytes[seg_idx];
-    const std::size_t seg_prefix_bytes = segment_prefix_bytes[seg_idx];
-    const int64_t seg_disp_bytes = segment_disp_bytes[seg_idx];
-    const int float_count = seg_len_bytes / (int)sizeof(float);
-    const __half *seg_in = cell_in + (seg_prefix_bytes / 2) / sizeof(__half);
-    float *seg_dst = (float *)(cell_dst_bytes + (std::size_t)seg_disp_bytes);
-    for (int elem = threadIdx.x; elem < float_count; elem += blockDim.x) {
-      seg_dst[elem] = powf(10.0f, __half2float(seg_in[elem]));
+  for (int seg = blockIdx.x; seg < num_segments; seg += gridDim.x) {
+    const int seg_len_b = segment_len_bytes[seg];
+    const std::size_t seg_pref_b = segment_prefix_bytes[seg];
+    const int64_t seg_disp_b = segment_disp_bytes[seg];
+    const int n = seg_len_b / (int)sizeof(float);
+    const __half *seg_in = cell_in + (seg_pref_b / 4);
+    char *seg_dst = cell_dst + (std::size_t)seg_disp_b;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      float x = powf(10.0f, __half2float(seg_in[i]));
+      store_f32_unaligned(seg_dst + (std::size_t)i * sizeof(float), x);
     }
   }
 }
-
 
 __global__ void pack_kernel_qfp8(const float *__restrict__ src,
-                                          const int64_t *__restrict__ disp,      
-                                          const int *__restrict__ len,           
-                                          const std::size_t *__restrict__ pref,  
-                                          int nseg, std::size_t extent_bytes,
-                                          std::size_t total_bytes, 
-                                          int count,
-                                          fp8_e4m3 *__restrict__ dst) {
+                                 const int64_t *__restrict__ disp,
+                                 const int *__restrict__ len,
+                                 const std::size_t *__restrict__ pref, int nseg,
+                                 std::size_t extent_bytes,
+                                 std::size_t total_bytes, int count,
+                                 fp8_e4m3 *__restrict__ dst) {
   const int cell = blockIdx.y;
-  if (cell >= count) return;
-  const char *base = (const char *)src + (std::size_t)cell * extent_bytes;
-  const std::size_t total_elements = total_bytes / sizeof(fp8_e4m3);
-  fp8_e4m3 *out = dst + (std::size_t)cell * total_elements;
+  if (cell >= count){
+    return;
+  }
+  const char *base =
+      reinterpret_cast<const char *>(src) + (std::size_t)cell * extent_bytes;
+  const std::size_t total_fp8_elems = total_bytes / sizeof(fp8_e4m3);
+  fp8_e4m3 *out = dst + (std::size_t)cell * total_fp8_elems;
 
   for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
     const int Lb = len[seg];
     const std::size_t Pb = pref[seg];
     const int64_t Db = disp[seg];
     const int n = Lb / (int)sizeof(float);
-    const float *sb = (const float *)(base + (std::size_t)Db);
-    fp8_e4m3 *db = out + Pb; 
-
+    const char *sb = base + (std::size_t)Db;
+    fp8_e4m3 *db = out + (Pb / sizeof(fp8_e4m3));
     for (int v = threadIdx.x; v < n; v += blockDim.x) {
-      float val = log10f(fmaxf(MINIMUM_SPARSITY_VALUE, sb[v]));
-      db[v] = fp8_e4m3(val); 
+      float f;
+      memcpy(&f, sb + v * sizeof(float), sizeof(float));
+      f = fmaxf(f, MINIMUM_SPARSITY_VALUE);
+      f = log10f(f);
+      db[v] = fp8_e4m3(f);
     }
   }
 }
 
-__global__ void unpack_kernel_qfp8(const fp8_e4m3 *__restrict__ src, 
-                                            const int64_t *__restrict__ disp,
-                                            const int *__restrict__ len, 
-                                            const std::size_t *__restrict__ pref, 
-                                            int nseg,
-                                            std::size_t extent_bytes,
-                                            std::size_t total_bytes,
-                                            int count, 
-                                            float *__restrict__ dst) {
+__global__ void unpack_kernel_qfp8(const fp8_e4m3 *__restrict__ src,
+                                   const int64_t *__restrict__ disp,
+                                   const int *__restrict__ len,
+                                   const std::size_t *__restrict__ pref,
+                                   int nseg, std::size_t extent_bytes,
+                                   std::size_t total_bytes, int count,
+                                   float *__restrict__ dst) {
   const int cell = blockIdx.y;
-  if (cell >= count) return;
+  if (cell >= count){
+    return;
+  }
 
-  char *obj = (char *)dst + (std::size_t)cell * extent_bytes;
-  const std::size_t total_elements = total_bytes / sizeof(fp8_e4m3);
-  const fp8_e4m3 *in = src + (std::size_t)cell * total_elements;
-
+  char *obj = reinterpret_cast<char *>(dst) + (std::size_t)cell * extent_bytes;
+  const std::size_t total_fp8_elems = total_bytes / sizeof(fp8_e4m3);
+  const fp8_e4m3 *in = src + (std::size_t)cell * total_fp8_elems;
   for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
     const int Lb = len[seg];
     const std::size_t Pb = pref[seg];
     const int64_t Db = disp[seg];
-
     const int n = Lb / (int)sizeof(float);
-    const fp8_e4m3 *sb = in + Pb; 
-    float *db = (float *)(obj + (std::size_t)Db);
-
+    const fp8_e4m3 *sb = in + (Pb / sizeof(fp8_e4m3));
+    char *db = obj + (std::size_t)Db;
     for (int v = threadIdx.x; v < n; v += blockDim.x) {
-      db[v] = powf(10.0f, (float)sb[v]);
+      float f = powf(10.0f, (float)sb[v]);
+      memcpy(db + v * sizeof(float), &f, sizeof(float));
     }
   }
 }
-
 
 
 void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
   const bool quantize_fp16 = (p->tag == QUANTIZE_VDF_FLAG_FP16);
-  const bool quantize_fp8 =  (p->tag == QUANTIZE_VDF_FLAG_FP8);
+  const bool quantize_fp8 = (p->tag == QUANTIZE_VDF_FLAG_FP8);
+  constexpr int maxGridY = 65535;
+  const int totalCells = count;
+  int offset = 0;
+  while (offset < totalCells) {
+    int batch = std::min(maxGridY, totalCells - offset);
+    dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
+    if (quantize_fp16) {
+      __half *dst_half = reinterpret_cast<__half *>(p->d_pack_buffer);
+      pack_kernel_qfp16<<<grid, block, 0, s>>>(
+          reinterpret_cast<const float *>(user) +
+              offset * (p->header.extent / sizeof(float)),
+          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+          p->header.total_bytes, batch,
+          dst_half + offset * (p->header.total_bytes / 2) / sizeof(__half));
+    } else if (quantize_fp8) {
+      fp8_e4m3 *dst_fp8 = reinterpret_cast<fp8_e4m3 *>(p->d_pack_buffer);
+      pack_kernel_qfp8<<<grid, block, 0, s>>>(
+          reinterpret_cast<const float *>(user) +
+              offset * (p->header.extent / sizeof(float)),
+          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+          p->header.total_bytes, batch,
+          dst_fp8 + offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3));
+    } else {
+      pack_kernel<<<grid, block, 0, s>>>(
+          user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
+          p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
+          batch,
+          p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
+    }
 
-  if (quantize_fp16) {
-    __half* dst_half = reinterpret_cast<__half*>(p->d_pack_buffer);
-    pack_kernel_qfp16<<<grid, block, 0, s>>>(
-        reinterpret_cast<const float*>(user),
-        p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg,
-        p->header.extent,
-        p->header.total_bytes,
-        count,
-        dst_half);
-  } else if (quantize_fp8) {
-    fp8_e4m3* dst_fp8 = reinterpret_cast<fp8_e4m3*>(p->d_pack_buffer);
-    pack_kernel_qfp8<<<grid, block, 0, s>>>(
-        reinterpret_cast<const float*>(user),
-        p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg,
-        p->header.extent,
-        p->header.total_bytes,
-        count,
-        dst_fp8);
-  } else {
-    pack_kernel<<<grid, block, 0, s>>>(
-        user, p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg,
-        p->header.extent,
-        p->header.total_bytes,
-        count,
-        p->d_pack_buffer);
-  }
-  const auto e = gpuGetLastError();
-  if (e != gpuSuccess) {
-    FATAL("Pack kernel (%s): %s",
-          quantize_fp16 ? "quantized" : "normal",
-          gpuGetErrorString(e));
+    const auto e = gpuGetLastError();
+    if (e != gpuSuccess) {
+      FATAL("Pack kernel (%s): %s  (offset=%d batch=%d)",
+            quantize_fp16 ? "qfp16" : (quantize_fp8 ? "qfp8" : "normal"),
+            gpuGetErrorString(e), offset, batch);
+    }
+    offset += batch;
   }
 }
 
@@ -542,41 +584,50 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
-
   const bool dequantize_fp16 = (p->tag == QUANTIZE_VDF_FLAG_FP16);
-  const bool dequantize_fp8 =  (p->tag == QUANTIZE_VDF_FLAG_FP8);
+  const bool dequantize_fp8 = (p->tag == QUANTIZE_VDF_FLAG_FP8);
+  constexpr int maxGridY = 65535;
+  const int totalCells = count;
+  int offset = 0;
 
-  if (dequantize_fp16) {
-    unpack_kernel_qfp16<<<grid, block, 0, s>>>(
-        reinterpret_cast<const __half*>(p->d_pack_buffer),
-        p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg, p->header.extent,
-        p->header.total_bytes, count,
-        reinterpret_cast<float*>(user));
-  } else  if (dequantize_fp8) {
-    unpack_kernel_qfp8<<<grid, block, 0, s>>>(
-        reinterpret_cast<const fp8_e4m3*>(p->d_pack_buffer),
-        p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg, p->header.extent,
-        p->header.total_bytes, 
-        count,
-        reinterpret_cast<float*>(user));
-  } else {
-    unpack_kernel<<<grid, block, 0, s>>>(
-        (const char*)p->d_pack_buffer,
-        p->d_disp, p->d_len, p->d_pref,
-        p->header.nseg, p->header.extent,
-        p->header.total_bytes, count,
-        user);
-  }
-  const auto e = gpuGetLastError();
-  if (e != gpuSuccess) {
-    FATAL("Unpack kernel (%s): %s",
-          dequantize_fp16 ? "quantized" : "normal",
-          gpuGetErrorString(e));
+  while (offset < totalCells) {
+    int batch = std::min(maxGridY, totalCells - offset);
+    dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
+    if (dequantize_fp16) {
+      unpack_kernel_qfp16<<<grid, block, 0, s>>>(
+          reinterpret_cast<const __half *>(p->d_pack_buffer) +
+              offset * (p->header.total_bytes / 2) / sizeof(__half),
+          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+          p->header.total_bytes, batch,
+          reinterpret_cast<float *>(user) +
+              offset * (p->header.extent / sizeof(float)));
+    } else if (dequantize_fp8) {
+      unpack_kernel_qfp8<<<grid, block, 0, s>>>(
+          reinterpret_cast<const fp8_e4m3 *>(p->d_pack_buffer) +
+              offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3),
+          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+          p->header.total_bytes, batch,
+          reinterpret_cast<float *>(user) +
+              offset * (p->header.extent / sizeof(float)));
+    } else {
+      unpack_kernel<<<grid, block, 0, s>>>(
+          (const char *)p->d_pack_buffer +
+              (std::size_t)offset * p->header.total_bytes,
+          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+          p->header.total_bytes, batch,
+          user + (std::size_t)offset * p->header.extent);
+    }
+
+    const auto e = gpuGetLastError();
+    if (e != gpuSuccess) {
+      FATAL("Unpack kernel (%s): %s  (offset=%d batch=%d)",
+            dequantize_fp16 ? "qfp16" : (dequantize_fp8 ? "qfp8" : "normal"),
+            gpuGetErrorString(e), offset, batch);
+    }
+    offset += batch;
   }
 }
+
 
 static void init() {
   if (initialized) {
