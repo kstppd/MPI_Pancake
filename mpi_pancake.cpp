@@ -174,7 +174,7 @@ using namespace hipcomp;
 
 #define FATAL(fmt, ...)                                                        \
   do {                                                                         \
-    fprintf(stderr, "[FATAL] %s:%d: " fmt "\n", __FILE__, __LINE__,          \
+    fprintf(stderr, "[FATAL] %s:%d: " fmt "\n", __FILE__, __LINE__,            \
             ##__VA_ARGS__);                                                    \
     MPI_Abort(MPI_COMM_WORLD, 42);                                             \
   } while (0)
