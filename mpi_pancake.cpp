@@ -20,8 +20,8 @@ Literature:
   [Very Good MPI Docs apart from manpages](https://rookiehpc.org/mpi/docs/mpi_datatype/index.html)
 
 TODOs:
-  [ ] Thread Waitall and lock map
-  [ ] Compress dpack with some nvCOMP hipCOMP
+  [X] Thread Waitall and lock map
+  [X] Compress dpack with some nvCOMP hipCOMP
   [X] Clean up memory after MPI_Finalize. We techincally leak everything but Vlasiator dies after so...
 
 Status for Vlasiator comms:
@@ -109,57 +109,6 @@ using namespace hipcomp;
 #define QUANTIZE_VDF_FLAG_FP8  43
 #define MINIMUM_SPARSITY_VALUE 1E-17
 
-#if defined(USE_HIP) || defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_fp8.h>
-#define  fp8_e4m3 __hip_fp8_e4m3
-#define gpuMalloc(ptr, size) hipMalloc(ptr, size)
-#define gpuFree(ptr) hipFree(ptr)
-#define gpuMemcpy(dst, src, sz, k) hipMemcpy(dst, src, sz, k)
-#define gpuMemcpyAsync(dst, src, sz, k, st) hipMemcpyAsync(dst, src, sz, k, st)
-#define gpuMemcpyHostToDevice hipMemcpyHostToDevice
-#define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define gpuDeviceSynchronize() hipDeviceSynchronize()
-#define gpuPointerGetAttributes hipPointerGetAttributes
-#define gpuPointerAttributes hipPointerAttribute_t
-#define gpuError_t hipError_t
-#define gpuSuccess hipSuccess
-#define gpuStream_t hipStream_t
-#define gpuStreamCreate hipStreamCreate
-#define gpuStreamDestroy hipStreamDestroy
-#define gpuStreamSynchronize hipStreamSynchronize
-#define gpuGetLastError() hipGetLastError()
-#define gpuGetErrorString(e) hipGetErrorString(e)
-#define gpuSetDevice hipSetDevice
-#define gpuGetDevice hipGetDevice
-#else
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#define  fp8_e4m3 __nv_fp8_e4m3
-#define gpuMalloc(ptr, size) cudaMalloc(ptr, size)
-#define gpuFree(ptr) cudaFree(ptr)
-#define gpuMemcpy(dst, src, sz, k) cudaMemcpy(dst, src, sz, k)
-#define gpuMemcpyAsync(dst, src, sz, k, st) cudaMemcpyAsync(dst, src, sz, k, st)
-#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
-#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
-#define gpuDeviceSynchronize() cudaDeviceSynchronize()
-#define gpuPointerGetAttributes cudaPointerGetAttributes
-#define gpuPointerAttributes cudaPointerAttributes
-#define gpuError_t cudaError_t
-#define gpuSuccess cudaSuccess
-#define gpuStream_t cudaStream_t
-#define gpuStreamCreate cudaStreamCreate
-#define gpuStreamDestroy cudaStreamDestroy
-#define gpuStreamSynchronize cudaStreamSynchronize
-#define gpuGetLastError() cudaGetLastError()
-#define gpuGetErrorString(e) cudaGetErrorString(e)
-#define gpuGetDevice cudaGetDevice
-#define gpuSetDevice cudaSetDevice
-#endif
-
-// #define VERBOSE
 #ifndef VERBOSE
 #define LOG(...)                                                               \
   do {                                                                         \
@@ -179,6 +128,74 @@ using namespace hipcomp;
     MPI_Abort(MPI_COMM_WORLD, 42);                                             \
   } while (0)
 
+
+#if defined(USE_HIP) || defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+#define  fp8_e4m3 __hip_fp8_e4m3
+#define GPU_CHECK(status)                                                    \
+do {                                                                         \
+  hipError_t err = (status);                                                 \
+  if (err != hipSuccess) {                                                   \
+    FATAL("HIP Error: %s", hipGetErrorString(err));                          \
+  }                                                                          \
+} while (0)
+
+#define fp8_e4m3 __hip_fp8_e4m3
+#define gpuMalloc(ptr, size)                GPU_CHECK(hipMalloc(ptr, size))
+#define gpuFree(ptr)                        GPU_CHECK(hipFree(ptr))
+#define gpuMemcpy(dst, src, sz, k)          GPU_CHECK(hipMemcpy(dst, src, sz, k))
+#define gpuMemcpyAsync(dst, src, sz, k, st) GPU_CHECK(hipMemcpyAsync(dst, src, sz, k, st))
+#define gpuDeviceSynchronize()              GPU_CHECK(hipDeviceSynchronize())
+#define gpuStreamCreate(s)                  GPU_CHECK(hipStreamCreate(s))
+#define gpuStreamDestroy(s)                 GPU_CHECK(hipStreamDestroy(s))
+#define gpuStreamSynchronize(s)             GPU_CHECK(hipStreamSynchronize(s))
+#define gpuSetDevice(d)                     GPU_CHECK(hipSetDevice(d))
+#define gpuGetDevice(p)                     GPU_CHECK(hipGetDevice(p))
+#define gpuMemcpyHostToDevice               hipMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost               hipMemcpyDeviceToHost
+#define gpuPointerGetAttributes             hipPointerGetAttributes
+#define gpuPointerAttributes                hipPointerAttribute_t
+#define gpuError_t                          hipError_t
+#define gpuSuccess                          hipSuccess
+#define gpuStream_t                         hipStream_t
+#define gpuGetLastError()                   hipGetLastError()
+#define gpuGetErrorString(e)                hipGetErrorString(e)
+#else
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#define  fp8_e4m3 __nv_fp8_e4m3
+#define GPU_CHECK(status)                                                    \
+do {                                                                         \
+  cudaError_t err = (status);                                                \
+  if (err != cudaSuccess) {                                                  \
+    FATAL("CUDA Error: %s", cudaGetErrorString(err));                        \
+  }                                                                          \
+} while (0)
+
+#define fp8_e4m3 __nv_fp8_e4m3
+#define gpuMalloc(ptr, size)                GPU_CHECK(cudaMalloc(ptr, size))
+#define gpuFree(ptr)                        GPU_CHECK(cudaFree(ptr))
+#define gpuMemcpy(dst, src, sz, k)          GPU_CHECK(cudaMemcpy(dst, src, sz, k))
+#define gpuMemcpyAsync(dst, src, sz, k, st) GPU_CHECK(cudaMemcpyAsync(dst, src, sz, k, st))
+#define gpuDeviceSynchronize()              GPU_CHECK(cudaDeviceSynchronize())
+#define gpuStreamCreate(s)                  GPU_CHECK(cudaStreamCreate(s))
+#define gpuStreamDestroy(s)                 GPU_CHECK(cudaStreamDestroy(s))
+#define gpuStreamSynchronize(s)             GPU_CHECK(cudaStreamSynchronize(s))
+#define gpuSetDevice(d)                     GPU_CHECK(cudaSetDevice(d))
+#define gpuGetDevice(p)                     GPU_CHECK(cudaGetDevice(p))
+#define gpuMemcpyHostToDevice               cudaMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost               cudaMemcpyDeviceToHost
+#define gpuPointerGetAttributes             cudaPointerGetAttributes
+#define gpuPointerAttributes                cudaPointerAttributes
+#define gpuError_t                          cudaError_t
+#define gpuSuccess                          cudaSuccess
+#define gpuStream_t                         cudaStream_t
+#define gpuGetLastError()                   cudaGetLastError()
+#define gpuGetErrorString(e)                cudaGetErrorString(e)
+#endif
 
 // Stolen from AST_Picasso@Graffathon 2025
 struct BumpAllocator {
