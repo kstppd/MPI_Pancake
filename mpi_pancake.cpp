@@ -93,6 +93,7 @@ Status for Vlasiator comms:
 */
 
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <unordered_map>
 #include "mpi.h"
