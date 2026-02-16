@@ -692,6 +692,7 @@ static void init() {
   }
   gpuStreamCreate(&s);
   initialized = true;
+  fprintf(stdout,"========= MPI_PANCAKE Initialized =========\n");
   return;
 }
 // clang-format on
@@ -1143,6 +1144,7 @@ int MPI_Finalize(void) {
   host_arena=nullptr;
   dev_arena=nullptr;
   gpuStreamDestroy(s);
+  fprintf(stdout,"========= MPI_PANCAKE Finalized =========\n");
   return rMPI_Finalize();
 }
 
