@@ -99,13 +99,6 @@ Status for Vlasiator comms:
 #include "mpi.h"
 #include <cstdint>
 
-//Currenlty only HIP and based on https://github.com/ROCm/hipCOMP-core/blob/main/tests/test_lz4.cpp 
-#ifdef KOMPRESS
-#include "hipcomp.hpp"
-#include "hipcomp/lz4.hpp"
-using namespace hipcomp;
-#endif
-
 #define QUANTIZE_VDF_FLAG_FP16 42
 #define QUANTIZE_VDF_FLAG_FP8  43
 #define MINIMUM_SPARSITY_VALUE 1E-17
@@ -234,47 +227,6 @@ struct BumpAllocator {
   void release() { sp = 0; }
 };
 
-#ifdef KOMPRESS
-//Kompression stuff
-inline std::size_t estimate_bytes_z(std::size_t input_bytes,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_compression(input_bytes).max_compressed_buffer_size;
-}
-
-inline std::size_t estimate_bytes_d(const uint8_t* d_comp,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_decompression(const_cast<uint8_t*>(d_comp)).decomp_data_size;
-}
-
-inline std::size_t compress_into(const uint8_t* d_in,
-                                 uint8_t* d_comp,
-                                 std::size_t input_bytes,
-                                 hipStream_t stream,
-                                 std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto cfg = manager.configure_compression(input_bytes);
-  manager.compress(d_in, d_comp, cfg);
-  hipStreamSynchronize(stream);
-  return manager.get_compressed_output_size(d_comp);
-}
-
-inline std::size_t decompress_into(const uint8_t* d_comp,
-                                   uint8_t* d_out,
-                                   hipStream_t stream,
-                                   std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto dcfg = manager.configure_decompression(const_cast<uint8_t*>(d_comp));
-  manager.decompress(d_out, const_cast<uint8_t*>(d_comp), dcfg);
-  hipStreamSynchronize(stream);
-  return dcfg.decomp_data_size;
-}
-
-#endif //KOMPRESS
-
 struct SOABlock {
   MPI_Aint disp;
   int len;
@@ -302,10 +254,6 @@ struct Pending {
   int count = 0;
   int tag = -1;
   MPI_Comm comm{};
-#ifdef KOMPRESS
-  std::size_t comp_bytes = 0;
-  char *d_comp_pack_buffer = nullptr;
-#endif
   struct Header {
     int nseg;
     std::size_t total_bytes;
@@ -564,30 +512,11 @@ void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   while (offset < totalCells) {
     int batch = std::min(maxGridY, totalCells - offset);
     dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
-    if (quantize_fp16) {
-      __half *dst_half = reinterpret_cast<__half *>(p->d_pack_buffer);
-      pack_kernel_qfp16<<<grid, block, 0, s>>>(
-          reinterpret_cast<const float *>(user) +
-              offset * (p->header.extent / sizeof(float)),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          dst_half + offset * (p->header.total_bytes / 2) / sizeof(__half));
-    } else if (quantize_fp8) {
-      fp8_e4m3 *dst_fp8 = reinterpret_cast<fp8_e4m3 *>(p->d_pack_buffer);
-      pack_kernel_qfp8<<<grid, block, 0, s>>>(
-          reinterpret_cast<const float *>(user) +
-              offset * (p->header.extent / sizeof(float)),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          dst_fp8 + offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3));
-    } else {
-      pack_kernel<<<grid, block, 0, s>>>(
-          user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
-          p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
-          batch,
-          p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
-    }
-
+    pack_kernel<<<grid, block, 0, s>>>(
+        user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
+        p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
+        batch,
+        p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
     const auto e = gpuGetLastError();
     if (e != gpuSuccess) {
       FATAL("Pack kernel (%s): %s  (offset=%d batch=%d)",
@@ -611,31 +540,12 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   while (offset < totalCells) {
     int batch = std::min(maxGridY, totalCells - offset);
     dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
-    if (dequantize_fp16) {
-      unpack_kernel_qfp16<<<grid, block, 0, s>>>(
-          reinterpret_cast<const __half *>(p->d_pack_buffer) +
-              offset * (p->header.total_bytes / 2) / sizeof(__half),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          reinterpret_cast<float *>(user) +
-              offset * (p->header.extent / sizeof(float)));
-    } else if (dequantize_fp8) {
-      unpack_kernel_qfp8<<<grid, block, 0, s>>>(
-          reinterpret_cast<const fp8_e4m3 *>(p->d_pack_buffer) +
-              offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          reinterpret_cast<float *>(user) +
-              offset * (p->header.extent / sizeof(float)));
-    } else {
-      unpack_kernel<<<grid, block, 0, s>>>(
-          (const char *)p->d_pack_buffer +
-              (std::size_t)offset * p->header.total_bytes,
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          user + (std::size_t)offset * p->header.extent);
-    }
-
+    unpack_kernel<<<grid, block, 0, s>>>(
+        (const char *)p->d_pack_buffer +
+            (std::size_t)offset * p->header.total_bytes,
+        p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+        p->header.total_bytes, batch,
+        user + (std::size_t)offset * p->header.extent);
     const auto e = gpuGetLastError();
     if (e != gpuSuccess) {
       FATAL("Unpack kernel (%s): %s  (offset=%d batch=%d)",
@@ -871,17 +781,6 @@ static void cpu_unpack(void *user_buf, int count, Pending *p) {
 static void gpu_pack(const void *user_buf, int count, Pending *p) {
   p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
   do_pack((const char *)user_buf, count, p, s);
-#ifdef KOMPRESS
-  std::size_t cap = estimate_bytes_z(p->pack_size, s);
-  auto *d_comp = dev_arena->allocate<uint8_t>(cap, 256);
-  const std::size_t comp_bytes =
-      compress_into(reinterpret_cast<const uint8_t *>(p->d_pack_buffer), d_comp,
-                    p->pack_size, s);
-  p->d_comp_pack_buffer = reinterpret_cast<char *>(d_comp);
-  p->comp_bytes = comp_bytes;
-  // fprintf(stderr,"Compression of %f x
-  // \n",(float)p->pack_size/(float)comp_bytes);
-#endif
   gpuStreamSynchronize(s);
 }
 
@@ -895,16 +794,6 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
     if (is_device_ptr(p->user_buf)) {
-#ifdef KOMPRESS
-      p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
-      const std::size_t decomp_bytes = decompress_into(
-          reinterpret_cast<const uint8_t *>(p->d_comp_pack_buffer),
-          reinterpret_cast<uint8_t *>(p->d_pack_buffer), s);
-      if (decomp_bytes != p->pack_size) {
-        FATAL("Decompressed size (%zu) VS wanted size (%zu).", decomp_bytes,
-              p->pack_size);
-      }
-#endif
       gpu_unpack(p->user_buf, p->count, p);
     } else {
       cpu_unpack(p->user_buf, p->count, p);
@@ -958,27 +847,14 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
     p->tag = tag;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
-    if (p->tag==QUANTIZE_VDF_FLAG_FP16){
-      p->pack_size/=2;
-    }
-    if (p->tag==QUANTIZE_VDF_FLAG_FP8){
-      p->pack_size/=4;
-    }
-
     build_lookaside(p);
 
     int ret = MPI_SUCCESS;
     if (is_device_ptr(buf)) {
       LOG("Dev SEND");
       gpu_pack(buf, count, p); //<== look inside it kompresses
-#ifdef KOMPRESS
-      ret = rMPI_Isend(p->d_comp_pack_buffer, (int)p->comp_bytes, MPI_BYTE,
-                       dest, tag, comm, &p->rreq);
-
-#else
       ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host SEND");
       cpu_pack(buf, count, p);
@@ -1013,28 +889,13 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     p->comm = comm;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
-    if (p->tag==QUANTIZE_VDF_FLAG_FP16){
-      p->pack_size/=2;
-    }
-    if (p->tag==QUANTIZE_VDF_FLAG_FP8){
-      p->pack_size/=4;
-    }
-
     build_lookaside(p);
     int ret = MPI_SUCCESS;
     if (is_device_ptr(buf)) {
       LOG("Dev RECV");
-#ifdef KOMPRESS
-      //Worst case scenario
-      const std::size_t max_comp_size = estimate_bytes_z(p->pack_size, s);
-      p->d_comp_pack_buffer = dev_arena->allocate<char>(max_comp_size, 256);
-      ret = rMPI_Irecv(p->d_comp_pack_buffer, (int)max_comp_size, MPI_BYTE, src,
-                       tag, comm, &p->rreq);
-#else
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
       ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host RECV");
       p->stage = host_arena->allocate<char>(p->pack_size, 16);
@@ -1098,13 +959,6 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
         pending.erase(it);
         continue;
       }
-#ifdef KOMPRESS
-      if (p->op == Pending::RECV) {
-        int got = 0;
-        MPI_Get_count(&st, MPI_BYTE, &got);
-        p->comp_bytes = (std::size_t)got;
-      }
-#endif
       do_complete(p, const_cast<MPI_Status *>(&st));
     } else {
       //for MPI_IGNORES which have no stats
