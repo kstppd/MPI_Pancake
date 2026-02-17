@@ -129,7 +129,7 @@ BenchResult pingpong_hindexed_bytes(int rank, int N, size_t whitespace_ratio,
         gpuMemcpy(verify_h, data_d, sizeof(float) * N, gpuMemcpyDefault));
 
     for (size_t i = 0; i < N; ++i) {
-      if (std::abs(verify_h[i] != data_h[i]) > 1e-4) {
+      if (std::abs(verify_h[i] - data_h[i]) > 1e-4) {
         sane = false;
         break;
       }
