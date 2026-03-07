@@ -913,21 +913,17 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
 }
 
 static int complete_request(MPI_Request *req, MPI_Status *st) {
-  if (*req == MPI_REQUEST_NULL){
+  if (*req == MPI_REQUEST_NULL) {
     return MPI_SUCCESS;
   }
-  Pending *p = nullptr;
   auto it = pending.find(*req);
   if (it == pending.end()) {
-    // not ours — delegate to real MPI_Wait
     return rMPI_Wait(req, st);
   }
-  p = it->second;
+  Pending *p = it->second;
   int ret = rMPI_Wait(&p->rreq, st);
   if (ret == MPI_SUCCESS) {
-    if (!(st && st->MPI_ERROR != MPI_SUCCESS)) {
-      do_complete(p, st);
-    }
+    do_complete(p, st);
   }
   pending.erase(it);
   *req = MPI_REQUEST_NULL;
