@@ -170,13 +170,13 @@ int main(int argc, char *argv[]) {
                     "----------------------------\n");
   }
 
-  for (int N = 1 << 5; N < (1 << 20); N = N << 1) {
+  for (int N = 1 << 10; N < (1 << 16); N = N << 1) {
     BenchResult res_pancake_fp32 =
         pingpong_hindexed_bytes(rank, N, 5, false, 0);
     BenchResult res_pancake_fp16 =
-        pingpong_hindexed_bytes(rank, N, 5, false, 42);
+        pingpong_hindexed_bytes(rank, N, 5, false, 0);
     BenchResult res_pancake_fp8 =
-        pingpong_hindexed_bytes(rank, N, 5, false, 43);
+        pingpong_hindexed_bytes(rank, N, 5, false, 0);
     BenchResult res_sync = pingpong_hindexed_bytes(rank, N, 5, true, 0);
 
     if (rank == 0) {

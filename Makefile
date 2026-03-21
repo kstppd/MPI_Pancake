@@ -6,12 +6,12 @@ BIN = libmpipancake.so
 
 ifeq ($(USE_CUDA), 1)
     CC      := nvcc
-    CFLAGS  := -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Werror -march=native -O3 " -x cu
-    LDFLAGS := -shared -Xcompiler="$(MPI_LDFLAGS)"
+    CFLAGS  := -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Wextra -march=native -O3 " -x cu
+    LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)"
 else ifeq ($(USE_HIP), 1)
     CC      := hipcc
-    CFLAGS  := -O3 -std=c++17 -fPIC -ffast-math -Wall -Werror -x hip
-    LDFLAGS := -shared  $(MPI_LDFLAGS)
+    CFLAGS  := -O3 -std=c++17 -fPIC -ffast-math -Wall -Werror -Wextra -x hip
+    LDFLAGS := -$(MPI_LDFLAGS)
     CFLAGS += --offload-arch=$(HIP_ARCH)
 else
     $(error No backend specified: USE_CUDA=1 or USE_HIP=1)
@@ -19,10 +19,18 @@ endif
 
 
 CFLAGS += -Xcompiler="$(MPI_CFLAGS)"
-all: libmpipancake
+.PHONY: all clean
 
-libmpipancake: mpi_pancake.cpp
-	$(CC) ${CFLAGS} $(LDFLAGS) -o ${BIN} mpi_pancake.cpp
+all: libmpipancake.so libmpisniffer.so test
+
+libmpipancake.so: mpi_pancake.cpp
+	$(CC) $(CFLAGS) -shared $(LDFLAGS) -o $@ $<
+
+libmpisniffer.so: mpi_sniffer.cpp
+	$(CC) $(CFLAGS) -shared $(LDFLAGS) -o $@ $<
+
+test: bench-gpu-2.cpp
+	$(CC) -ccbin=mpicxx $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f $(BIN)
+	rm libmpipancake.so libmpisniffer.so test
