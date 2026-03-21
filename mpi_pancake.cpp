@@ -1,10 +1,10 @@
 #if 0 
-hipcc -O3 -DKOMPRESS -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
+hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
 exit
 #endif
 // clang-format off
 /*
-mpi_hooks.cpp:
+mpi_pancake.cpp:
   LD_PRELOAD-able library that hooks Isend/Irecv and
   does gpu packing/unpacking. Assumes GPU aware MPI
   implementation. Developed for Vlasiator so a lot
@@ -20,8 +20,8 @@ Literature:
   [Very Good MPI Docs apart from manpages](https://rookiehpc.org/mpi/docs/mpi_datatype/index.html)
 
 TODOs:
-  [ ] Thread Waitall and lock map
-  [ ] Compress dpack with some nvCOMP hipCOMP
+  [X] Thread Waitall and lock map
+  [X] Compress dpack with some nvCOMP hipCOMP
   [X] Clean up memory after MPI_Finalize. We techincally leak everything but Vlasiator dies after so...
 
 Status for Vlasiator comms:
@@ -93,55 +93,12 @@ Status for Vlasiator comms:
 */
 
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <unordered_map>
 #include "mpi.h"
+#include <cstdint>
 
-//Currenlty only HIP and based on https://github.com/ROCm/hipCOMP-core/blob/main/tests/test_lz4.cpp 
-#ifdef KOMPRESS
-#include "hipcomp.hpp"
-#include "hipcomp/lz4.hpp"
-using namespace hipcomp;
-#endif
-
-
-#if defined(USE_HIP) || defined(__HIPCC__)
-#include <hip/hip_runtime.h>
-#define gpuMalloc(ptr, size) hipMalloc(ptr, size)
-#define gpuFree(ptr) hipFree(ptr)
-#define gpuMemcpy(dst, src, sz, k) hipMemcpy(dst, src, sz, k)
-#define gpuMemcpyAsync(dst, src, sz, k, st) hipMemcpyAsync(dst, src, sz, k, st)
-#define gpuMemcpyHostToDevice hipMemcpyHostToDevice
-#define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define gpuDeviceSynchronize() hipDeviceSynchronize()
-#define gpuPointerGetAttributes hipPointerGetAttributes
-#define gpuPointerAttributes hipPointerAttribute_t
-#define gpuError_t hipError_t
-#define gpuSuccess hipSuccess
-#define gpuStream_t hipStream_t
-#define gpuStreamCreate hipStreamCreate
-#define gpuStreamDestroy hipStreamDestroy
-#define gpuStreamSynchronize hipStreamSynchronize
-#else
-#include <cuda_runtime.h>
-#define gpuMalloc(ptr, size) cudaMalloc(ptr, size)
-#define gpuFree(ptr) cudaFree(ptr)
-#define gpuMemcpy(dst, src, sz, k) cudaMemcpy(dst, src, sz, k)
-#define gpuMemcpyAsync(dst, src, sz, k, st) cudaMemcpyAsync(dst, src, sz, k, st)
-#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
-#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
-#define gpuDeviceSynchronize() cudaDeviceSynchronize()
-#define gpuPointerGetAttributes cudaPointerGetAttributes
-#define gpuPointerAttributes cudaPointerAttributes
-#define gpuError_t cudaError_t
-#define gpuSuccess cudaSuccess
-#define gpuStream_t cudaStream_t
-#define gpuStreamCreate cudaStreamCreate
-#define gpuStreamDestroy cudaStreamDestroy
-#define gpuStreamSynchronize cudaStreamSynchronize
-#endif
-
-// #define VERBOSE
 #ifndef VERBOSE
 #define LOG(...)                                                               \
   do {                                                                         \
@@ -156,11 +113,79 @@ using namespace hipcomp;
 
 #define FATAL(fmt, ...)                                                        \
   do {                                                                         \
-    fprintf(stderr, "[FATAL] %s:%d: " fmt "\n", __FILE__, __LINE__,          \
+    fprintf(stderr, "[FATAL] %s:%d: " fmt "\n", __FILE__, __LINE__,            \
             ##__VA_ARGS__);                                                    \
     MPI_Abort(MPI_COMM_WORLD, 42);                                             \
   } while (0)
 
+
+#if defined(USE_HIP) || defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+#define  fp8_e4m3 __hip_fp8_e4m3
+#define GPU_CHECK(status)                                                    \
+do {                                                                         \
+  hipError_t err = (status);                                                 \
+  if (err != hipSuccess) {                                                   \
+    FATAL("HIP Error: %s", hipGetErrorString(err));                          \
+  }                                                                          \
+} while (0)
+
+#define fp8_e4m3 __hip_fp8_e4m3
+#define gpuMalloc(ptr, size)                GPU_CHECK(hipMalloc(ptr, size))
+#define gpuFree(ptr)                        GPU_CHECK(hipFree(ptr))
+#define gpuMemcpy(dst, src, sz, k)          GPU_CHECK(hipMemcpy(dst, src, sz, k))
+#define gpuMemcpyAsync(dst, src, sz, k, st) GPU_CHECK(hipMemcpyAsync(dst, src, sz, k, st))
+#define gpuDeviceSynchronize()              GPU_CHECK(hipDeviceSynchronize())
+#define gpuStreamCreate(s)                  GPU_CHECK(hipStreamCreate(s))
+#define gpuStreamDestroy(s)                 GPU_CHECK(hipStreamDestroy(s))
+#define gpuStreamSynchronize(s)             GPU_CHECK(hipStreamSynchronize(s))
+#define gpuSetDevice(d)                     GPU_CHECK(hipSetDevice(d))
+#define gpuGetDevice(p)                     GPU_CHECK(hipGetDevice(p))
+#define gpuMemcpyHostToDevice               hipMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost               hipMemcpyDeviceToHost
+#define gpuPointerGetAttributes             hipPointerGetAttributes
+#define gpuPointerAttributes                hipPointerAttribute_t
+#define gpuError_t                          hipError_t
+#define gpuSuccess                          hipSuccess
+#define gpuStream_t                         hipStream_t
+#define gpuGetLastError()                   hipGetLastError()
+#define gpuGetErrorString(e)                hipGetErrorString(e)
+#else
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#define  fp8_e4m3 __nv_fp8_e4m3
+#define GPU_CHECK(status)                                                    \
+do {                                                                         \
+  cudaError_t err = (status);                                                \
+  if (err != cudaSuccess) {                                                  \
+    FATAL("CUDA Error: %s", cudaGetErrorString(err));                        \
+  }                                                                          \
+} while (0)
+
+#define fp8_e4m3 __nv_fp8_e4m3
+#define gpuMalloc(ptr, size)                GPU_CHECK(cudaMalloc(ptr, size))
+#define gpuFree(ptr)                        GPU_CHECK(cudaFree(ptr))
+#define gpuMemcpy(dst, src, sz, k)          GPU_CHECK(cudaMemcpy(dst, src, sz, k))
+#define gpuMemcpyAsync(dst, src, sz, k, st) GPU_CHECK(cudaMemcpyAsync(dst, src, sz, k, st))
+#define gpuDeviceSynchronize()              GPU_CHECK(cudaDeviceSynchronize())
+#define gpuStreamCreate(s)                  GPU_CHECK(cudaStreamCreate(s))
+#define gpuStreamDestroy(s)                 GPU_CHECK(cudaStreamDestroy(s))
+#define gpuStreamSynchronize(s)             GPU_CHECK(cudaStreamSynchronize(s))
+#define gpuSetDevice(d)                     GPU_CHECK(cudaSetDevice(d))
+#define gpuGetDevice(p)                     GPU_CHECK(cudaGetDevice(p))
+#define gpuMemcpyHostToDevice               cudaMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost               cudaMemcpyDeviceToHost
+#define gpuPointerGetAttributes             cudaPointerGetAttributes
+#define gpuPointerAttributes                cudaPointerAttributes
+#define gpuError_t                          cudaError_t
+#define gpuSuccess                          cudaSuccess
+#define gpuStream_t                         cudaStream_t
+#define gpuGetLastError()                   cudaGetLastError()
+#define gpuGetErrorString(e)                cudaGetErrorString(e)
+#endif
 
 // Stolen from AST_Picasso@Graffathon 2025
 struct BumpAllocator {
@@ -198,47 +223,6 @@ struct BumpAllocator {
   void release() { sp = 0; }
 };
 
-#ifdef KOMPRESS
-//Kompression stuff
-inline std::size_t estimate_bytes_z(std::size_t input_bytes,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_compression(input_bytes).max_compressed_buffer_size;
-}
-
-inline std::size_t estimate_bytes_d(const uint8_t* d_comp,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_decompression(const_cast<uint8_t*>(d_comp)).decomp_data_size;
-}
-
-inline std::size_t compress_into(const uint8_t* d_in,
-                                 uint8_t* d_comp,
-                                 std::size_t input_bytes,
-                                 hipStream_t stream,
-                                 std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto cfg = manager.configure_compression(input_bytes);
-  manager.compress(d_in, d_comp, cfg);
-  hipStreamSynchronize(stream);
-  return manager.get_compressed_output_size(d_comp);
-}
-
-inline std::size_t decompress_into(const uint8_t* d_comp,
-                                   uint8_t* d_out,
-                                   hipStream_t stream,
-                                   std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto dcfg = manager.configure_decompression(const_cast<uint8_t*>(d_comp));
-  manager.decompress(d_out, const_cast<uint8_t*>(d_comp), dcfg);
-  hipStreamSynchronize(stream);
-  return dcfg.decomp_data_size;
-}
-
-#endif //KOMPRESS
-
 struct SOABlock {
   MPI_Aint disp;
   int len;
@@ -247,6 +231,7 @@ struct SOABlock {
 
 struct Pending {
   enum Op { SEND, RECV } op;
+  enum HW { HOST,DEVICE} hw;
   MPI_Request rreq{};
   SOABlock *blocks = nullptr;
   std::size_t nblocks = 0;
@@ -264,11 +249,8 @@ struct Pending {
   char *d_pack_buffer = nullptr;
   void *user_buf = nullptr;
   int count = 0;
+  int tag = -1;
   MPI_Comm comm{};
-#ifdef KOMPRESS
-  std::size_t comp_bytes = 0;
-  char *d_comp_pack_buffer = nullptr;
-#endif
   struct Header {
     int nseg;
     std::size_t total_bytes;
@@ -288,13 +270,14 @@ static int (*rMPI_Finalize)     (void)                                          
 
 // SETTINGS
 static constexpr std::size_t POOL = 8ull * 1024ull * 1024ull * 1024ull;
+static constexpr std::size_t INIT_MAP_CAPACITY = 1<<12;
 static constexpr std::size_t INIT_BLOCKS = 8 * 512;
+//~SETTINGS
 static BumpAllocator *host_arena = nullptr;
 static BumpAllocator *dev_arena = nullptr;
 static bool initialized = false;
-static gpuStream_t s;
+static gpuStream_t s = nullptr;
 static std::unordered_map<MPI_Request, Pending *> pending;
-
 
 
 __global__ void pack_kernel(const char *__restrict__ src,
@@ -356,28 +339,53 @@ __global__ void unpack_kernel(const char *__restrict__ src,
   }
 }
 
-
-
 void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
-  pack_kernel<<<grid, block, 0, s>>>(
-      user, p->d_disp, p->d_len, p->d_pref, p->header.nseg,
-      p->header.extent, p->header.total_bytes, count, p->d_pack_buffer);
+  constexpr int maxGridY = 65535;
+  const int totalCells = count;
+  int offset = 0;
+  while (offset < totalCells) {
+    int batch = std::min(maxGridY, totalCells - offset);
+    dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
+    pack_kernel<<<grid, block, 0, s>>>(
+        user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
+        p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
+        batch,
+        p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
+    const auto e = gpuGetLastError();
+    if (e != gpuSuccess) {
+      FATAL("Pack kernel failed: %s",gpuGetErrorString(e));
+    }
+    offset += batch;
+  }
 }
 
 void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  dim3 grid(std::min<int>((int)p->nblocks, 65535), count);
-  unpack_kernel<<<grid, block, 0, s>>>(
-      (const char *)p->d_pack_buffer, p->d_disp, p->d_len, p->d_pref,
-      p->header.nseg, p->header.extent, p->header.total_bytes, count, user);
-}
+  constexpr int maxGridY = 65535;
+  const int totalCells = count;
+  int offset = 0;
 
+  while (offset < totalCells) {
+    int batch = std::min(maxGridY, totalCells - offset);
+    dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
+    unpack_kernel<<<grid, block, 0, s>>>(
+        (const char *)p->d_pack_buffer +
+            (std::size_t)offset * p->header.total_bytes,
+        p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+        p->header.total_bytes, batch,
+        user + (std::size_t)offset * p->header.extent);
+    const auto e = gpuGetLastError();
+    if (e != gpuSuccess) {
+      FATAL("Unpack kernel failed: %s",gpuGetErrorString(e));
+    }
+    offset += batch;
+  }
+}
 
 
 static void init() {
@@ -397,7 +405,7 @@ static void init() {
   void *h = malloc(POOL);
   void *d = nullptr;
   gpuMalloc(&d, POOL);
-  pending.reserve(1<<12);
+  pending.reserve(INIT_MAP_CAPACITY);
   if (!h) {
     FATAL("ERROR:host pool alloc failed\n");
   }
@@ -410,25 +418,57 @@ static void init() {
                                 rMPI_Isend &&
                                 rMPI_Irecv &&
                                 rMPI_Type_get_env &&
-                                rMPI_Type_size
-                                && rMPI_Wait &&
+                                rMPI_Type_size && 
+                                rMPI_Wait &&
                                 rMPI_Waitall &&
                                 rMPI_Finalize;
 
   if (!are_all_hooks_ok){
-    fprintf(stderr, "ERROR:Some hook could not be dlopened!\n");
-    MPI_Abort(MPI_COMM_WORLD, 32);
+    FATAL("ERROR:Some hook could not be dlopened!\n");
   }
   host_arena = new BumpAllocator(h, POOL);
   dev_arena = new BumpAllocator(d, POOL);
+  if (!host_arena || !dev_arena) {
+    FATAL("ERROR:host/dev pool pointer alloc failed\n");
+  }
   gpuStreamCreate(&s);
   initialized = true;
+  fprintf(stdout,"========= MPI_PANCAKE Initialized =========\n");
   return;
 }
 // clang-format on
 
-// TODO Will look into this at some point!
-static inline bool is_device_ptr(const void *p) { return true; }
+static inline bool is_device_ptr(const void *ptr) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__) 
+  hipPointerAttribute_t attr;
+  hipError_t err = hipPointerGetAttributes(&attr, ptr);
+  if (err != hipSuccess) {
+    hipGetLastError();
+    FATAL("COULD NOT DETECT POINTER");
+    return false;
+  }
+  return (attr.type == hipMemoryTypeDevice ||
+          attr.type == hipMemoryTypeManaged);
+
+#else
+  cudaPointerAttributes attr;
+  cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    FATAL("COULD NOT DETECT POINTER");
+    return false;
+  }
+
+  bool result = false;
+#if CUDART_VERSION >= 10000
+  result =
+      (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged);
+#else
+  result = (attr.memoryType == cudaMemoryTypeDevice);
+#endif
+  return result;
+#endif
+}
 
 static int get_combiner(MPI_Datatype t) {
   int ni = 0, na = 0, nt = 0, comb = 0;
@@ -438,6 +478,7 @@ static int get_combiner(MPI_Datatype t) {
 
 // This is what I ended up doing becasue at times we get MPI_DUP
 //  which underneath is the usual STRUCT->HINDEXED->MPI_BYTE
+// This can get turn into tail recursion hell
 static MPI_Datatype unwrap_datatype(MPI_Datatype t) {
   int ni = 0, na = 0, nt = 0, comb = 0;
   if (rMPI_Type_get_env(t, &ni, &na, &nt, &comb) != MPI_SUCCESS) {
@@ -600,17 +641,6 @@ static void cpu_unpack(void *user_buf, int count, Pending *p) {
 static void gpu_pack(const void *user_buf, int count, Pending *p) {
   p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
   do_pack((const char *)user_buf, count, p, s);
-#ifdef KOMPRESS
-  std::size_t cap = estimate_bytes_z(p->pack_size, s);
-  auto *d_comp = dev_arena->allocate<uint8_t>(cap, 256);
-  const std::size_t comp_bytes =
-      compress_into(reinterpret_cast<const uint8_t *>(p->d_pack_buffer), d_comp,
-                    p->pack_size, s);
-  p->d_comp_pack_buffer = reinterpret_cast<char *>(d_comp);
-  p->comp_bytes = comp_bytes;
-  // fprintf(stderr,"Compression of %f x
-  // \n",(float)p->pack_size/(float)comp_bytes);
-#endif
   gpuStreamSynchronize(s);
 }
 
@@ -619,21 +649,17 @@ static void gpu_unpack(void *user_buf, int count, Pending *p) {
   gpuStreamSynchronize(s);
 }
 
+const char *get_first_data_address(const void *base_ptr, MPI_Datatype dtype) {
+  MPI_Aint true_lb = 0;
+  MPI_Aint true_extent = 0;
+  MPI_Type_get_true_extent(dtype, &true_lb, &true_extent);
+  return static_cast<const char *>(base_ptr) + true_lb;
+}
 
 static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
-    if (is_device_ptr(p->user_buf)) {
-#ifdef KOMPRESS
-      p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
-      const std::size_t decomp_bytes = decompress_into(
-          reinterpret_cast<const uint8_t *>(p->d_comp_pack_buffer),
-          reinterpret_cast<uint8_t *>(p->d_pack_buffer), s);
-      if (decomp_bytes != p->pack_size) {
-        FATAL("Decompressed size (%zu) VS wanted size (%zu).", decomp_bytes,
-              p->pack_size);
-      }
-#endif
+    if (p->hw == Pending::HW::DEVICE) {
       gpu_unpack(p->user_buf, p->count, p);
     } else {
       cpu_unpack(p->user_buf, p->count, p);
@@ -642,20 +668,17 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
 }
 
 static int complete_request(MPI_Request *req, MPI_Status *st) {
-  if (*req == MPI_REQUEST_NULL)
+  if (*req == MPI_REQUEST_NULL) {
     return MPI_SUCCESS;
-  Pending *p = nullptr;
+  }
   auto it = pending.find(*req);
   if (it == pending.end()) {
-    // not ours — delegate to real MPI_Wait
     return rMPI_Wait(req, st);
   }
-  p = it->second;
+  Pending *p = it->second;
   int ret = rMPI_Wait(&p->rreq, st);
   if (ret == MPI_SUCCESS) {
-    if (!(st && st->MPI_ERROR != MPI_SUCCESS)) {
-      do_complete(p, st);
-    }
+    do_complete(p, st);
   }
   pending.erase(it);
   *req = MPI_REQUEST_NULL;
@@ -670,35 +693,43 @@ extern "C" {
 int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  const char *first_address = get_first_data_address(buf, dtype);
+  
   // This will also crash the code
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
   }
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
+  }
+#endif
+
   int type_sz = 0;
   rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
+    if (p==nullptr){
+      FATAL("Failed to allocate Pending pointer");
+    }
     p->op = Pending::SEND;
+    p->tag = tag;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
-
     build_lookaside(p);
 
     int ret = MPI_SUCCESS;
-    if (is_device_ptr(buf)) {
+    if (is_device_ptr(first_address)) {
       LOG("Dev SEND");
+      p->hw=Pending::HW::DEVICE;
       gpu_pack(buf, count, p); //<== look inside it kompresses
-#ifdef KOMPRESS
-      ret = rMPI_Isend(p->d_comp_pack_buffer, (int)p->comp_bytes, MPI_BYTE,
-                       dest, tag, comm, &p->rreq);
-
-#else
       ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host SEND");
+      p->hw=Pending::HW::HOST;
       cpu_pack(buf, count, p);
       ret = rMPI_Isend(p->pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
@@ -715,16 +746,24 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  const char *first_address = get_first_data_address(buf, dtype);
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
 
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
+  }
+#endif
   int type_sz = 0;
   rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     p->op = Pending::RECV;
+    p->tag = tag;
     p->user_buf = buf;
     p->count = count;
     p->comm = comm;
@@ -733,21 +772,15 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
 
     build_lookaside(p);
     int ret = MPI_SUCCESS;
-    if (is_device_ptr(buf)) {
+    if (is_device_ptr(first_address)) {
       LOG("Dev RECV");
-#ifdef KOMPRESS
-      //Worst case scenario
-      const std::size_t max_comp_size = estimate_bytes_z(p->pack_size, s);
-      p->d_comp_pack_buffer = dev_arena->allocate<char>(max_comp_size, 256);
-      ret = rMPI_Irecv(p->d_comp_pack_buffer, (int)max_comp_size, MPI_BYTE, src,
-                       tag, comm, &p->rreq);
-#else
+      p->hw=Pending::HW::DEVICE;
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
       ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host RECV");
+      p->hw=Pending::HW::HOST;
       p->stage = host_arena->allocate<char>(p->pack_size, 16);
       ret = rMPI_Irecv(p->stage, (int)p->pack_size, MPI_BYTE, src, tag, comm,
                        &p->rreq);
@@ -809,13 +842,6 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
         pending.erase(it);
         continue;
       }
-#ifdef KOMPRESS
-      if (p->op == Pending::RECV) {
-        int got = 0;
-        MPI_Get_count(&st, MPI_BYTE, &got);
-        p->comp_bytes = (std::size_t)got;
-      }
-#endif
       do_complete(p, const_cast<MPI_Status *>(&st));
     } else {
       //for MPI_IGNORES which have no stats
@@ -850,7 +876,12 @@ int MPI_Finalize(void) {
   init();
   free(host_arena->mem);
   gpuFree(dev_arena->mem);
-  // gpuStreamDestroy(s);
+  delete host_arena;
+  delete dev_arena;
+  host_arena=nullptr;
+  dev_arena=nullptr;
+  gpuStreamDestroy(s);
+  fprintf(stdout,"========= MPI_PANCAKE Finalized =========\n");
   return rMPI_Finalize();
 }
 
