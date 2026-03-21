@@ -1,10 +1,10 @@
 #if 0 
-hipcc -O3 -DKOMPRESS -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
+hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
 exit
 #endif
 // clang-format off
 /*
-mpi_hooks.cpp:
+mpi_pancake.cpp:
   LD_PRELOAD-able library that hooks Isend/Irecv and
   does gpu packing/unpacking. Assumes GPU aware MPI
   implementation. Developed for Vlasiator so a lot
@@ -98,17 +98,6 @@ Status for Vlasiator comms:
 #include <unordered_map>
 #include "mpi.h"
 #include <cstdint>
-
-//Currenlty only HIP and based on https://github.com/ROCm/hipCOMP-core/blob/main/tests/test_lz4.cpp 
-#ifdef KOMPRESS
-#include "hipcomp.hpp"
-#include "hipcomp/lz4.hpp"
-using namespace hipcomp;
-#endif
-
-#define QUANTIZE_VDF_FLAG_FP16 42
-#define QUANTIZE_VDF_FLAG_FP8  43
-#define MINIMUM_SPARSITY_VALUE 1E-17
 
 #ifndef VERBOSE
 #define LOG(...)                                                               \
@@ -234,47 +223,6 @@ struct BumpAllocator {
   void release() { sp = 0; }
 };
 
-#ifdef KOMPRESS
-//Kompression stuff
-inline std::size_t estimate_bytes_z(std::size_t input_bytes,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_compression(input_bytes).max_compressed_buffer_size;
-}
-
-inline std::size_t estimate_bytes_d(const uint8_t* d_comp,
-                               hipStream_t stream,
-                               std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  return manager.configure_decompression(const_cast<uint8_t*>(d_comp)).decomp_data_size;
-}
-
-inline std::size_t compress_into(const uint8_t* d_in,
-                                 uint8_t* d_comp,
-                                 std::size_t input_bytes,
-                                 hipStream_t stream,
-                                 std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto cfg = manager.configure_compression(input_bytes);
-  manager.compress(d_in, d_comp, cfg);
-  hipStreamSynchronize(stream);
-  return manager.get_compressed_output_size(d_comp);
-}
-
-inline std::size_t decompress_into(const uint8_t* d_comp,
-                                   uint8_t* d_out,
-                                   hipStream_t stream,
-                                   std::size_t chunk_size = (1u << 16)){
-  LZ4Manager manager{chunk_size, HIPCOMP_TYPE_CHAR, stream};
-  auto dcfg = manager.configure_decompression(const_cast<uint8_t*>(d_comp));
-  manager.decompress(d_out, const_cast<uint8_t*>(d_comp), dcfg);
-  hipStreamSynchronize(stream);
-  return dcfg.decomp_data_size;
-}
-
-#endif //KOMPRESS
-
 struct SOABlock {
   MPI_Aint disp;
   int len;
@@ -303,10 +251,6 @@ struct Pending {
   int count = 0;
   int tag = -1;
   MPI_Comm comm{};
-#ifdef KOMPRESS
-  std::size_t comp_bytes = 0;
-  char *d_comp_pack_buffer = nullptr;
-#endif
   struct Header {
     int nseg;
     std::size_t total_bytes;
@@ -395,205 +339,24 @@ __global__ void unpack_kernel(const char *__restrict__ src,
   }
 }
 
-__device__ __forceinline__ uint32_t load_u32_unaligned(const void *p) {
-  const uint8_t *b = (const uint8_t *)p;
-  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
-         ((uint32_t)b[3] << 24);
-}
-
-__device__ __forceinline__ void store_u32_unaligned(void *p, uint32_t u) {
-  uint8_t *b = (uint8_t *)p;
-  b[0] = (uint8_t)(u & 0xFF);
-  b[1] = (uint8_t)((u >> 8) & 0xFF);
-  b[2] = (uint8_t)((u >> 16) & 0xFF);
-  b[3] = (uint8_t)((u >> 24) & 0xFF);
-}
-
-__device__ __forceinline__ float load_f32_unaligned(const void *p) {
-  union {
-    uint32_t u;
-    float f;
-  } v;
-  v.u = load_u32_unaligned(p);
-  return v.f;
-}
-
-__device__ __forceinline__ void store_f32_unaligned(void *p, float f) {
-  union {
-    uint32_t u;
-    float f;
-  } v;
-  v.f = f;
-  store_u32_unaligned(p, v.u);
-}
-
-__global__ void
-pack_kernel_qfp16(const float *__restrict__ src,
-                  const int64_t *__restrict__ segment_disp_bytes,
-                  const int *__restrict__ segment_len_bytes,
-                  const std::size_t *__restrict__ segment_prefix_bytes,
-                  int num_segments, std::size_t cell_stride_bytes,
-                  std::size_t packed_bytes_per_cell, int num_cells,
-                  __half *__restrict__ dst) {
-  const int cell_idx = blockIdx.y;
-  if (cell_idx >= num_cells){
-    return;
-  }
-  const char *cell_src =
-      (const char *)src + (std::size_t)cell_idx * cell_stride_bytes;
-  const std::size_t half_elems_per_cell =
-      (packed_bytes_per_cell / 2) / sizeof(__half);
-  __half *cell_out = dst + (std::size_t)cell_idx * half_elems_per_cell;
-  for (int seg = blockIdx.x; seg < num_segments; seg += gridDim.x) {
-    const int seg_len_b = segment_len_bytes[seg];
-    const std::size_t seg_pref_b = segment_prefix_bytes[seg];
-    const int64_t seg_disp_b = segment_disp_bytes[seg];
-    const int n = seg_len_b / (int)sizeof(float);
-    const char *seg_src = cell_src + (std::size_t)seg_disp_b;
-    __half *seg_out = cell_out + (seg_pref_b / 4);
-
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-      float x = load_f32_unaligned(seg_src + (std::size_t)i * sizeof(float));
-      x = fmaxf(x, (float)MINIMUM_SPARSITY_VALUE);
-      seg_out[i] = __float2half_rn(log10f(x));
-    }
-  }
-}
-
-__global__ void
-unpack_kernel_qfp16(const __half *__restrict__ src,
-                    const int64_t *__restrict__ segment_disp_bytes,
-                    const int *__restrict__ segment_len_bytes,
-                    const std::size_t *__restrict__ segment_prefix_bytes,
-                    int num_segments, std::size_t cell_stride_bytes,
-                    std::size_t packed_bytes_per_cell, int num_cells,
-                    float *__restrict__ dst) {
-  const int cell_idx = blockIdx.y;
-  if (cell_idx >= num_cells){
-    return;
-  }
-  char *cell_dst = (char *)dst + (std::size_t)cell_idx * cell_stride_bytes;
-  const std::size_t half_elems_per_cell =
-      (packed_bytes_per_cell / 2) / sizeof(__half);
-  const __half *cell_in = src + (std::size_t)cell_idx * half_elems_per_cell;
-  for (int seg = blockIdx.x; seg < num_segments; seg += gridDim.x) {
-    const int seg_len_b = segment_len_bytes[seg];
-    const std::size_t seg_pref_b = segment_prefix_bytes[seg];
-    const int64_t seg_disp_b = segment_disp_bytes[seg];
-    const int n = seg_len_b / (int)sizeof(float);
-    const __half *seg_in = cell_in + (seg_pref_b / 4);
-    char *seg_dst = cell_dst + (std::size_t)seg_disp_b;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-      float x = powf(10.0f, __half2float(seg_in[i]));
-      store_f32_unaligned(seg_dst + (std::size_t)i * sizeof(float), x);
-    }
-  }
-}
-
-__global__ void pack_kernel_qfp8(const float *__restrict__ src,
-                                 const int64_t *__restrict__ disp,
-                                 const int *__restrict__ len,
-                                 const std::size_t *__restrict__ pref, int nseg,
-                                 std::size_t extent_bytes,
-                                 std::size_t total_bytes, int count,
-                                 fp8_e4m3 *__restrict__ dst) {
-  const int cell = blockIdx.y;
-  if (cell >= count){
-    return;
-  }
-  const char *base =
-      reinterpret_cast<const char *>(src) + (std::size_t)cell * extent_bytes;
-  const std::size_t total_fp8_elems = total_bytes / sizeof(fp8_e4m3);
-  fp8_e4m3 *out = dst + (std::size_t)cell * total_fp8_elems;
-
-  for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
-    const int Lb = len[seg];
-    const std::size_t Pb = pref[seg];
-    const int64_t Db = disp[seg];
-    const int n = Lb / (int)sizeof(float);
-    const char *sb = base + (std::size_t)Db;
-    fp8_e4m3 *db = out + (Pb / sizeof(fp8_e4m3));
-    for (int v = threadIdx.x; v < n; v += blockDim.x) {
-      float f;
-      memcpy(&f, sb + v * sizeof(float), sizeof(float));
-      f = fmaxf(f, MINIMUM_SPARSITY_VALUE);
-      f = log10f(f);
-      db[v] = fp8_e4m3(f);
-    }
-  }
-}
-
-__global__ void unpack_kernel_qfp8(const fp8_e4m3 *__restrict__ src,
-                                   const int64_t *__restrict__ disp,
-                                   const int *__restrict__ len,
-                                   const std::size_t *__restrict__ pref,
-                                   int nseg, std::size_t extent_bytes,
-                                   std::size_t total_bytes, int count,
-                                   float *__restrict__ dst) {
-  const int cell = blockIdx.y;
-  if (cell >= count){
-    return;
-  }
-
-  char *obj = reinterpret_cast<char *>(dst) + (std::size_t)cell * extent_bytes;
-  const std::size_t total_fp8_elems = total_bytes / sizeof(fp8_e4m3);
-  const fp8_e4m3 *in = src + (std::size_t)cell * total_fp8_elems;
-  for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
-    const int Lb = len[seg];
-    const std::size_t Pb = pref[seg];
-    const int64_t Db = disp[seg];
-    const int n = Lb / (int)sizeof(float);
-    const fp8_e4m3 *sb = in + (Pb / sizeof(fp8_e4m3));
-    char *db = obj + (std::size_t)Db;
-    for (int v = threadIdx.x; v < n; v += blockDim.x) {
-      float f = powf(10.0f, (float)sb[v]);
-      memcpy(db + v * sizeof(float), &f, sizeof(float));
-    }
-  }
-}
-
-
 void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  const bool quantize_fp16 = (p->tag == QUANTIZE_VDF_FLAG_FP16);
-  const bool quantize_fp8 = (p->tag == QUANTIZE_VDF_FLAG_FP8);
   constexpr int maxGridY = 65535;
   const int totalCells = count;
   int offset = 0;
   while (offset < totalCells) {
     int batch = std::min(maxGridY, totalCells - offset);
     dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
-    if (quantize_fp16) {
-      __half *dst_half = reinterpret_cast<__half *>(p->d_pack_buffer);
-      pack_kernel_qfp16<<<grid, block, 0, s>>>(
-          reinterpret_cast<const float *>(user) +
-              offset * (p->header.extent / sizeof(float)),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          dst_half + offset * (p->header.total_bytes / 2) / sizeof(__half));
-    } else if (quantize_fp8) {
-      fp8_e4m3 *dst_fp8 = reinterpret_cast<fp8_e4m3 *>(p->d_pack_buffer);
-      pack_kernel_qfp8<<<grid, block, 0, s>>>(
-          reinterpret_cast<const float *>(user) +
-              offset * (p->header.extent / sizeof(float)),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          dst_fp8 + offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3));
-    } else {
-      pack_kernel<<<grid, block, 0, s>>>(
-          user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
-          p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
-          batch,
-          p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
-    }
-
+    pack_kernel<<<grid, block, 0, s>>>(
+        user + (std::size_t)offset * p->header.extent, p->d_disp, p->d_len,
+        p->d_pref, p->header.nseg, p->header.extent, p->header.total_bytes,
+        batch,
+        p->d_pack_buffer + (std::size_t)offset * p->header.total_bytes);
     const auto e = gpuGetLastError();
     if (e != gpuSuccess) {
-      FATAL("Pack kernel (%s): %s  (offset=%d batch=%d)",
-            quantize_fp16 ? "qfp16" : (quantize_fp8 ? "qfp8" : "normal"),
-            gpuGetErrorString(e), offset, batch);
+      FATAL("Pack kernel failed: %s",gpuGetErrorString(e));
     }
     offset += batch;
   }
@@ -603,8 +366,6 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
-  const bool dequantize_fp16 = (p->tag == QUANTIZE_VDF_FLAG_FP16);
-  const bool dequantize_fp8 = (p->tag == QUANTIZE_VDF_FLAG_FP8);
   constexpr int maxGridY = 65535;
   const int totalCells = count;
   int offset = 0;
@@ -612,36 +373,15 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
   while (offset < totalCells) {
     int batch = std::min(maxGridY, totalCells - offset);
     dim3 grid(std::min<int>((int)p->nblocks, 65535), batch);
-    if (dequantize_fp16) {
-      unpack_kernel_qfp16<<<grid, block, 0, s>>>(
-          reinterpret_cast<const __half *>(p->d_pack_buffer) +
-              offset * (p->header.total_bytes / 2) / sizeof(__half),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          reinterpret_cast<float *>(user) +
-              offset * (p->header.extent / sizeof(float)));
-    } else if (dequantize_fp8) {
-      unpack_kernel_qfp8<<<grid, block, 0, s>>>(
-          reinterpret_cast<const fp8_e4m3 *>(p->d_pack_buffer) +
-              offset * (p->header.total_bytes / 4) / sizeof(fp8_e4m3),
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          reinterpret_cast<float *>(user) +
-              offset * (p->header.extent / sizeof(float)));
-    } else {
-      unpack_kernel<<<grid, block, 0, s>>>(
-          (const char *)p->d_pack_buffer +
-              (std::size_t)offset * p->header.total_bytes,
-          p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
-          p->header.total_bytes, batch,
-          user + (std::size_t)offset * p->header.extent);
-    }
-
+    unpack_kernel<<<grid, block, 0, s>>>(
+        (const char *)p->d_pack_buffer +
+            (std::size_t)offset * p->header.total_bytes,
+        p->d_disp, p->d_len, p->d_pref, p->header.nseg, p->header.extent,
+        p->header.total_bytes, batch,
+        user + (std::size_t)offset * p->header.extent);
     const auto e = gpuGetLastError();
     if (e != gpuSuccess) {
-      FATAL("Unpack kernel (%s): %s  (offset=%d batch=%d)",
-            dequantize_fp16 ? "qfp16" : (dequantize_fp8 ? "qfp8" : "normal"),
-            gpuGetErrorString(e), offset, batch);
+      FATAL("Unpack kernel failed: %s",gpuGetErrorString(e));
     }
     offset += batch;
   }
@@ -901,17 +641,6 @@ static void cpu_unpack(void *user_buf, int count, Pending *p) {
 static void gpu_pack(const void *user_buf, int count, Pending *p) {
   p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
   do_pack((const char *)user_buf, count, p, s);
-#ifdef KOMPRESS
-  std::size_t cap = estimate_bytes_z(p->pack_size, s);
-  auto *d_comp = dev_arena->allocate<uint8_t>(cap, 256);
-  const std::size_t comp_bytes =
-      compress_into(reinterpret_cast<const uint8_t *>(p->d_pack_buffer), d_comp,
-                    p->pack_size, s);
-  p->d_comp_pack_buffer = reinterpret_cast<char *>(d_comp);
-  p->comp_bytes = comp_bytes;
-  // fprintf(stderr,"Compression of %f x
-  // \n",(float)p->pack_size/(float)comp_bytes);
-#endif
   gpuStreamSynchronize(s);
 }
 
@@ -931,16 +660,6 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
     if (p->hw == Pending::HW::DEVICE) {
-#ifdef KOMPRESS
-      p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
-      const std::size_t decomp_bytes = decompress_into(
-          reinterpret_cast<const uint8_t *>(p->d_comp_pack_buffer),
-          reinterpret_cast<uint8_t *>(p->d_pack_buffer), s);
-      if (decomp_bytes != p->pack_size) {
-        FATAL("Decompressed size (%zu) VS wanted size (%zu).", decomp_bytes,
-              p->pack_size);
-      }
-#endif
       gpu_unpack(p->user_buf, p->count, p);
     } else {
       cpu_unpack(p->user_buf, p->count, p);
@@ -999,13 +718,6 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
     p->tag = tag;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
-    if (p->tag==QUANTIZE_VDF_FLAG_FP16){
-      p->pack_size/=2;
-    }
-    if (p->tag==QUANTIZE_VDF_FLAG_FP8){
-      p->pack_size/=4;
-    }
-
     build_lookaside(p);
 
     int ret = MPI_SUCCESS;
@@ -1013,14 +725,8 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
       LOG("Dev SEND");
       p->hw=Pending::HW::DEVICE;
       gpu_pack(buf, count, p); //<== look inside it kompresses
-#ifdef KOMPRESS
-      ret = rMPI_Isend(p->d_comp_pack_buffer, (int)p->comp_bytes, MPI_BYTE,
-                       dest, tag, comm, &p->rreq);
-
-#else
       ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host SEND");
       p->hw=Pending::HW::HOST;
@@ -1063,29 +769,15 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     p->comm = comm;
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
-    if (p->tag==QUANTIZE_VDF_FLAG_FP16){
-      p->pack_size/=2;
-    }
-    if (p->tag==QUANTIZE_VDF_FLAG_FP8){
-      p->pack_size/=4;
-    }
 
     build_lookaside(p);
     int ret = MPI_SUCCESS;
     if (is_device_ptr(first_address)) {
       LOG("Dev RECV");
       p->hw=Pending::HW::DEVICE;
-#ifdef KOMPRESS
-      //Worst case scenario
-      const std::size_t max_comp_size = estimate_bytes_z(p->pack_size, s);
-      p->d_comp_pack_buffer = dev_arena->allocate<char>(max_comp_size, 256);
-      ret = rMPI_Irecv(p->d_comp_pack_buffer, (int)max_comp_size, MPI_BYTE, src,
-                       tag, comm, &p->rreq);
-#else
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
       ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
                        comm, &p->rreq);
-#endif
     } else {
       LOG("Host RECV");
       p->hw=Pending::HW::HOST;
@@ -1150,13 +842,6 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
         pending.erase(it);
         continue;
       }
-#ifdef KOMPRESS
-      if (p->op == Pending::RECV) {
-        int got = 0;
-        MPI_Get_count(&st, MPI_BYTE, &got);
-        p->comp_bytes = (std::size_t)got;
-      }
-#endif
       do_complete(p, const_cast<MPI_Status *>(&st));
     } else {
       //for MPI_IGNORES which have no stats
