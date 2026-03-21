@@ -283,6 +283,7 @@ struct SOABlock {
 
 struct Pending {
   enum Op { SEND, RECV } op;
+  enum HW { HOST,DEVICE} hw;
   MPI_Request rreq{};
   SOABlock *blocks = nullptr;
   std::size_t nblocks = 0;
@@ -697,8 +698,37 @@ static void init() {
 }
 // clang-format on
 
-// TODO Will look into this at some point!
-static inline bool is_device_ptr(const void *p) { return true; }
+static inline bool is_device_ptr(const void *ptr) {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__) 
+  hipPointerAttribute_t attr;
+  hipError_t err = hipPointerGetAttributes(&attr, ptr);
+  if (err != hipSuccess) {
+    hipGetLastError();
+    FATAL("COULD NOT DETECT POINTER");
+    return false;
+  }
+  return (attr.type == hipMemoryTypeDevice ||
+          attr.type == hipMemoryTypeManaged);
+
+#else
+  cudaPointerAttributes attr;
+  cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    FATAL("COULD NOT DETECT POINTER");
+    return false;
+  }
+
+  bool result = false;
+#if CUDART_VERSION >= 10000
+  result =
+      (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged);
+#else
+  result = (attr.memoryType == cudaMemoryTypeDevice);
+#endif
+  return result;
+#endif
+}
 
 static int get_combiner(MPI_Datatype t) {
   int ni = 0, na = 0, nt = 0, comb = 0;
@@ -890,11 +920,17 @@ static void gpu_unpack(void *user_buf, int count, Pending *p) {
   gpuStreamSynchronize(s);
 }
 
+const char *get_first_data_address(const void *base_ptr, MPI_Datatype dtype) {
+  MPI_Aint true_lb = 0;
+  MPI_Aint true_extent = 0;
+  MPI_Type_get_true_extent(dtype, &true_lb, &true_extent);
+  return static_cast<const char *>(base_ptr) + true_lb;
+}
 
 static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
-    if (is_device_ptr(p->user_buf)) {
+    if (p->hw == Pending::HW::DEVICE) {
 #ifdef KOMPRESS
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
       const std::size_t decomp_bytes = decompress_into(
@@ -938,14 +974,23 @@ extern "C" {
 int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  const char *first_address = get_first_data_address(buf, dtype);
+  
   // This will also crash the code
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
   }
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
+  }
+#endif
+
   int type_sz = 0;
   rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     if (p==nullptr){
       FATAL("Failed to allocate Pending pointer");
@@ -964,8 +1009,9 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
     build_lookaside(p);
 
     int ret = MPI_SUCCESS;
-    if (is_device_ptr(buf)) {
+    if (is_device_ptr(first_address)) {
       LOG("Dev SEND");
+      p->hw=Pending::HW::DEVICE;
       gpu_pack(buf, count, p); //<== look inside it kompresses
 #ifdef KOMPRESS
       ret = rMPI_Isend(p->d_comp_pack_buffer, (int)p->comp_bytes, MPI_BYTE,
@@ -977,6 +1023,7 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 #endif
     } else {
       LOG("Host SEND");
+      p->hw=Pending::HW::HOST;
       cpu_pack(buf, count, p);
       ret = rMPI_Isend(p->pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
@@ -993,14 +1040,21 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  const char *first_address = get_first_data_address(buf, dtype);
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
 
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
+  }
+#endif
   int type_sz = 0;
   rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     p->op = Pending::RECV;
     p->tag = tag;
@@ -1018,8 +1072,9 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
 
     build_lookaside(p);
     int ret = MPI_SUCCESS;
-    if (is_device_ptr(buf)) {
+    if (is_device_ptr(first_address)) {
       LOG("Dev RECV");
+      p->hw=Pending::HW::DEVICE;
 #ifdef KOMPRESS
       //Worst case scenario
       const std::size_t max_comp_size = estimate_bytes_z(p->pack_size, s);
@@ -1033,6 +1088,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
 #endif
     } else {
       LOG("Host RECV");
+      p->hw=Pending::HW::HOST;
       p->stage = host_arena->allocate<char>(p->pack_size, 16);
       ret = rMPI_Irecv(p->stage, (int)p->pack_size, MPI_BYTE, src, tag, comm,
                        &p->rreq);
