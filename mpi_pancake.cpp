@@ -3,6 +3,14 @@ hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ff
 exit
 #endif
 // clang-format off
+
+/*
+To build using make do one of these:
+    make USE_CUDA=1
+    make USE_HIP=1
+*/
+
+
 /*
 mpi_pancake.cpp:
   LD_PRELOAD-able library that hooks Isend/Irecv and

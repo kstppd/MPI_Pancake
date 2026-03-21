@@ -1,23 +1,28 @@
-NVCC       = nvcc
-HOSTCXX    = mpicxx
-OPT        = -O3
-CXXSTD     = -std=c++17
-COMMON     = $(OPT) $(CXXSTD) -ccbin $(HOSTCXX) -x cu
-XWARN      = -Wall -Wextra
-LIB        = libmpi_pancake.so
-LIB_SRC    = mpi_pancake.cpp
-BENCH      = bench-gpu
-BENCH_SRC  = bench-gpu.cpp
+USE_CUDA ?= 0
+USE_HIP  ?= 0
+MPI_CFLAGS := $(shell mpicxx --showme:compile)
+MPI_LDFLAGS := $(addprefix -L,$(shell mpicxx --showme:libdirs)) $(addprefix -l,$(shell mpicxx --showme:libs))
+BIN = libmpipancake.so
+
+ifeq ($(USE_CUDA), 1)
+    CC      := nvcc
+    CFLAGS  := -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Werror -march=native -O3 " -x cu
+    LDFLAGS := -shared -Xcompiler="$(MPI_LDFLAGS)"
+else ifeq ($(USE_HIP), 1)
+    CC      := hipcc
+    CFLAGS  := -O3 -std=c++17 -fPIC -ffast-math -Wall -Werror -x hip
+    LDFLAGS := -shared  $(MPI_LDFLAGS)
+    CFLAGS += --offload-arch=$(HIP_ARCH)
+else
+    $(error No backend specified: USE_CUDA=1 or USE_HIP=1)
+endif
 
 
-all: $(LIB) $(BENCH)
+CFLAGS += -Xcompiler="$(MPI_CFLAGS)"
+all: libmpipancake
 
-$(LIB): $(LIB_SRC)
-	$(NVCC) $(COMMON) -Xcompiler="-fPIC -shared $(XWARN)" mpi_pancake.cpp -o $(LIB)
+libmpipancake: mpi_pancake.cpp
+	$(CC) ${CFLAGS} $(LDFLAGS) -o ${BIN} mpi_pancake.cpp
 
-$(BENCH): $(BENCH_SRC)
-	$(NVCC) $(COMMON) -Xcompiler="$(XWARN)" bench-gpu.cpp -o $(BENCH)
-
-allclean:
-	rm -f $(LIB) $(BENCH)
-
+clean:
+	rm -f $(BIN)
