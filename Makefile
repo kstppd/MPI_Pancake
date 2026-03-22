@@ -7,7 +7,7 @@ BIN = libmpipancake.so
 ifeq ($(USE_CUDA), 1)
     CC      := nvcc
     CFLAGS  := -ccbin mpicxx -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Wextra -march=native -O3 " -x cu
-    LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)"
+    LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)" -lnvToolsExt
 else ifeq ($(USE_HIP), 1)
     CC      := hipcc
     CFLAGS  := -O3 -std=c++17 -fPIC -ffast-math -Wall -Werror -Wextra -x hip

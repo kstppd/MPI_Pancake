@@ -132,6 +132,21 @@ Status for Vlasiator comms:
 #include "mpi.h"
 #include <cstdint>
 
+#ifndef NOPROFILE
+#ifdef __CUDACC__
+#include <nvToolsExt.h>
+#define PROFILE_START(msg) nvtxRangePushA((msg))
+#define PROFILE_END() nvtxRangePop()
+#else
+#include <roctx.h>
+#define PROFILE_START(msg) roctxRangePush((msg))
+#define PROFILE_END() roctxRangePop()
+#endif
+#else
+#define PROFILE_START(msg)
+#define PROFILE_END()
+#endif
+
 #ifndef VERBOSE
 #define LOG(...)                                                               \
   do {                                                                         \
@@ -425,6 +440,7 @@ static void init() {
   if (initialized) {
     return;
   }
+  PROFILE_START("PANCAKE-INIT");
   rMPI_Init         =  (decltype(rMPI_Init))         dlsym(RTLD_NEXT, "MPI_Init");
   rMPI_Init_thread  =  (decltype(rMPI_Init_thread))  dlsym(RTLD_NEXT, "MPI_Init_thread");
   rMPI_Isend        =  (decltype(rMPI_Isend))        dlsym(RTLD_NEXT, "MPI_Isend");
@@ -467,11 +483,13 @@ static void init() {
   gpuStreamCreate(&s);
   initialized = true;
   fprintf(stdout,"========= MPI_PANCAKE Initialized =========\n");
+  PROFILE_END();
   return;
 }
 // clang-format on
 
 static inline bool is_device_ptr(const void *ptr) {
+  PROFILE_START("PANCAKE-POINTER-QUERY");
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__) 
   hipPointerAttribute_t attr;
   hipError_t err = hipPointerGetAttributes(&attr, ptr);
@@ -480,6 +498,7 @@ static inline bool is_device_ptr(const void *ptr) {
     FATAL("COULD NOT DETECT POINTER");
     return false;
   }
+  PROFILE_END();
   return (attr.type == hipMemoryTypeDevice ||
           attr.type == hipMemoryTypeManaged);
 
@@ -499,6 +518,7 @@ static inline bool is_device_ptr(const void *ptr) {
 #else
   result = (attr.memoryType == cudaMemoryTypeDevice);
 #endif
+  PROFILE_END();
   return result;
 #endif
 }
@@ -693,7 +713,9 @@ static void do_complete(Pending *p, MPI_Status *st_opt) {
   (void)st_opt;
   if (p->op == Pending::RECV) {
     if (p->hw == Pending::HW::DEVICE) {
+      PROFILE_START("PANCAKE-GPU-UNPACK");
       gpu_unpack(p->user_buf, p->count, p);
+      PROFILE_END();
     } else {
       cpu_unpack(p->user_buf, p->count, p);
     }
@@ -704,21 +726,27 @@ static int complete_request(MPI_Request *req, MPI_Status *st) {
   if (*req == MPI_REQUEST_NULL) {
     return MPI_SUCCESS;
   }
+  PROFILE_START("PANCAKE-HASHMAP-FIND");
   auto it = pending.find(*req);
+  PROFILE_END();
   if (it == pending.end()) {
     return rMPI_Wait(req, st);
   }
   Pending *p = it->second;
   int ret = rMPI_Wait(&p->rreq, st);
   if (ret == MPI_SUCCESS) {
+    PROFILE_START("PANCAKE-DO-COMPLETE");
     do_complete(p, st);
+    PROFILE_END();
   }
   pending.erase(it);
   *req = MPI_REQUEST_NULL;
+  PROFILE_START("PANCAKE-RELEASE-POOLS");
   if (pending.empty()) {
     host_arena->release();
     dev_arena->release();
   }
+  PROFILE_END();
   return ret;
 }
 
@@ -726,7 +754,9 @@ extern "C" {
 int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  PROFILE_START("PANCAKE-ISEND-GET-FIRST-POINTER");
   const char *first_address = get_first_data_address(buf, dtype);
+  PROFILE_END();
   
   // This will also crash the code
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
@@ -743,21 +773,29 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
   rMPI_Type_size(dtype, &type_sz);
 
   if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
+    PROFILE_START("PANCAKE-ISEND-ALLOC-POOL");
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
+    PROFILE_END();
     if (p==nullptr){
       FATAL("Failed to allocate Pending pointer");
     }
     p->op = Pending::SEND;
     p->tag = tag;
+    PROFILE_START("PANCAKE-ISEND-FLATTEN-BLOCKS");
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
+    PROFILE_END();
     p->pack_size = (std::size_t)count * p->total_bytes;
+    PROFILE_START("PANCAKE-ISEND-LOOKASIDE");
     build_lookaside(p);
+    PROFILE_END();
 
     int ret = MPI_SUCCESS;
     if (is_device_ptr(first_address)) {
       LOG("Dev SEND");
       p->hw=Pending::HW::DEVICE;
+      PROFILE_START("PANCAKE-ISEND-GPU-PACK");
       gpu_pack(buf, count, p); //<== look inside it kompresses
+      PROFILE_END();
       ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
     } else {
@@ -800,10 +838,14 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     p->user_buf = buf;
     p->count = count;
     p->comm = comm;
+    PROFILE_START("PANCAKE-IRECV-FLATTEN");
+    PROFILE_END();
     p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
     p->pack_size = (std::size_t)count * p->total_bytes;
 
+    PROFILE_START("PANCAKE-IRECV-LOOKASIDE");
     build_lookaside(p);
+    PROFILE_END();
     int ret = MPI_SUCCESS;
     if (is_device_ptr(first_address)) {
       LOG("Dev RECV");
