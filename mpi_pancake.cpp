@@ -5,13 +5,6 @@ exit
 // clang-format off
 
 /*
-To build using make do one of these:
-    make USE_CUDA=1
-    make USE_HIP=1
-*/
-
-
-/*
 mpi_pancake.cpp:
   LD_PRELOAD-able library that hooks Isend/Irecv and
   does gpu packing/unpacking. Assumes GPU aware MPI
@@ -19,6 +12,38 @@ mpi_pancake.cpp:
   more things can be added to support more codes.
 Author: Kostis Papadakis(kpapadakis@protonmail.com) 2025
 
+To build using MAKE do one of these:
+    make USE_CUDA=1
+    make USE_HIP=1
+    Toggles:
+      -DVERBOSE to print some info messages
+      -DHOST_PACK_ON if defined then packing cpu data is also enabled    
+
+And here are some onliners too:
+  nvcc -O3 -std=c++17 -ccbin mpic++ -Xcompiler=" -fPIC -shared -Wall  " -x cu mpi_pancake.cpp -o libmpipancake.so -lmpi -gencode arch=compute_90,code=sm_90
+  hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions  -o libmpipancake.so
+
+Test the lib:
+   LD_PRELOAD=./libmpipancake.so mpirun -n 2 ./test
+      ========= MPI_PANCAKE Initialized =========
+      ========= MPI_PANCAKE Initialized =========
+      Bytes           | Pancake (ms) | Control (ms) | VALIDATION
+      -----------------------------------------------------------
+      3413            | 6.0052       | 0.0163       | OK
+      6826            | 1.9103       | 0.0202       | OK
+      13653           | 1.5135       | 0.0323       | OK
+      27306           | 1.5760       | 0.0283       | OK
+      54613           | 1.7283       | 0.0301       | OK
+      109226          | 1.8979       | 0.0392       | OK
+      218453          | 2.1469       | 0.0647       | OK
+      436906          | 2.2533       | 0.1038       | OK
+      873813          | 2.6399       | 0.1826       | OK
+      1747626         | 3.4685       | 0.3523       | OK
+      ========= MPI_PANCAKE Finalized =========
+      ========= MPI_PANCAKE Finalized =========
+
+
+      
 Literature:
   [GPU custom packing](https://carlpearson.net/post/20201006-mpi-pack/)
   [Poisson Issues in 2D due to strided comms](https://blogs.fau.de/adityauj/2025/02/27/cuda-aware-mpi-part-4-optimizing-strided-data-communication-between-gpus/)

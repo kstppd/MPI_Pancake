@@ -161,37 +161,27 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  // Print Header once before the loop
   if (rank == 0) {
-    fprintf(stderr, "%-15s | %-12s | %-12s | %-12s | %-12s | %-6s\n", "Bytes",
-            "Pancake FP32 (ms)", "Pancake FP16 (ms)", "Pancake FP8 (ms)",
-            "Control (ms)", "VALIDATION");
+    fprintf(stderr, "%-15s | %-12s | %-12s | %-6s\n", "Bytes",
+            "Pancake (ms)", "Control (ms)", "VALIDATION");
     fprintf(stderr, "----------------------------------------------------------"
                     "----------------------------\n");
   }
 
-  for (int N = 1 << 10; N < (1 << 16); N = N << 1) {
+  for (int N = 1 << 10; N < (1 << 20); N = N << 1) {
     BenchResult res_pancake_fp32 =
-        pingpong_hindexed_bytes(rank, N, 5, false, 0);
-    BenchResult res_pancake_fp16 =
-        pingpong_hindexed_bytes(rank, N, 5, false, 0);
-    BenchResult res_pancake_fp8 =
         pingpong_hindexed_bytes(rank, N, 5, false, 0);
     BenchResult res_sync = pingpong_hindexed_bytes(rank, N, 5, true, 0);
 
     if (rank == 0) {
       float moved_bytes = sizeof(float) * ((float)N) * (5.0 / 6.0);
-      bool all_sane = res_pancake_fp32.is_sane && res_pancake_fp16.is_sane &&
-                      res_pancake_fp8.is_sane && res_sync.is_sane;
+      bool all_sane = res_pancake_fp32.is_sane && res_sync.is_sane;
 
-      fprintf(stderr, "%-15zu | %-12.4f | %-12.4f | %-12.4f | %-12.4f | %-6s\n",
+      fprintf(stderr, "%-15zu | %-12.4f | %-12.4f | %-6s\n",
               (size_t)moved_bytes, res_pancake_fp32.avg_time * 1000.0,
-              res_pancake_fp16.avg_time * 1000.0,
-              res_pancake_fp8.avg_time * 1000.0, res_sync.avg_time * 1000.0,
-              all_sane ? "true" : "false");
+              res_sync.avg_time * 1000.0, all_sane ? "OK" : "ERROR");
     }
   }
-
   MPI_Finalize();
   return 0;
 }

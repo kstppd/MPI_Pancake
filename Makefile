@@ -6,7 +6,7 @@ BIN = libmpipancake.so
 
 ifeq ($(USE_CUDA), 1)
     CC      := nvcc
-    CFLAGS  := -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Wextra -march=native -O3 " -x cu
+    CFLAGS  := -ccbin mpicxx -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Wextra -march=native -O3 " -x cu
     LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)"
 else ifeq ($(USE_HIP), 1)
     CC      := hipcc
@@ -30,7 +30,7 @@ libmpisniffer.so: mpi_sniffer.cpp
 	$(CC) $(CFLAGS) -shared $(LDFLAGS) -o $@ $<
 
 test: bench-gpu-2.cpp
-	$(CC) -ccbin=mpicxx $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
 	rm libmpipancake.so libmpisniffer.so test
