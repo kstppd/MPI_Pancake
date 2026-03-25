@@ -1,17 +1,23 @@
 ## MPI Pancake 
 MPI_Pancake is a lightweight, LD_PRELOADable library which tries to optimize MPI GPU communications from MPI_Derived types by hooking MPI_Isend and MPI_Irecv calls and then performing GPU packing and unpacking. The library is developed for Vlasiator but can be used with all kind of software that do MPI comms with GPU data (especially those using MPI Derived types).
 
+### Limitations
 **Curretnly MPI_Pancake will flatten `STRUCT HINDEXED MPI_BYTE` and `STRUCT MPI_BYTE` nested types that are using GPU memory but this is easily expandable to more 
 complex or simpler types.** If you are interested in using MPI_Pancake with your data please open an issue.
+
+**MPI_Pancake currently hooks Isend/Irecv. This can also be easily expanded to non blocking/collective calls but I would prefer to do this when the need arises instead
+of trying to catch everything at once.**
 
 ## Buiding 
 You can use either the Makefile provided and use either `make USE_CUDA=1` or `make USE_HIP=1`. However sometimes the MPI wrappers are weird so you might want to use the following one liners if the Makefile fails (one day I might add cmake support). This will build `libmpipancake.so`,`libmpisniffer.so` and `test`.
 
 ### HIP systems
-`hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions  -o libmpipancake.so`
+`hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp  -o libmpipancake.so`
+`hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_sniffer.cpp  -o libmpisniffer.so`
 
 ### CUDA systems
-`nvcc   -O3  -std=c++17 -ccbin mpicxx   -Xcompiler=" -fPIC -shared -Wall " -x cu mpi_pancake.cpp -o libmpipancake.so -lmpi`
+`nvcc -O3 -std=c++17 -ccbin mpicxx -Xcompiler=" -fPIC -shared -Wall " -x cu mpi_pancake.cpp -o libmpipancake.so -lmpi`
+`nvcc -O3 -std=c++17 -ccbin mpicxx -Xcompiler=" -fPIC -shared -Wall " -x cu mpi_sniffer.cpp -o libmpisniffer.so -lmpi`
 
 
 ## Usage
