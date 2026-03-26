@@ -29,7 +29,7 @@ libmpipancake.so: mpi_pancake.cpp
 libmpisniffer.so: mpi_sniffer.cpp
 	$(CC) $(CFLAGS) -shared $(LDFLAGS) -o $@ $<
 
-test: bench-gpu-2.cpp
+test: test.cpp
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
