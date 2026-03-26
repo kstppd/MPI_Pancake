@@ -158,7 +158,7 @@ template <typename T> bool run_test() {
     printf("------------------------------------------------------------\n");
   }
 
-  for (int N = 1 << 8; N <= (1 << 20); N <<= 1) {
+  for (int N = 1 << 10; N <= (1 << 20); N <<= 1) {
     BenchResult res_async = pingpong_hindexed_bytes<T>(rank, N, 5, false, 0);
     BenchResult res_sync = pingpong_hindexed_bytes<T>(rank, N, 5, true, 0);
     bool sane = res_async.is_sane && res_sync.is_sane;

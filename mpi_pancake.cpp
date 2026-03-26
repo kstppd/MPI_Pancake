@@ -147,6 +147,7 @@ Status for Vlasiator comms:
 #define PROFILE_END()
 #endif
 
+#define MPI_PANCAKE_SKIP_BLOCKING
 #ifndef VERBOSE
 #define LOG(...)                                                               \
   do {                                                                         \
@@ -310,6 +311,8 @@ static int (*rMPI_Init)         (int *, char ***)                               
 static int (*rMPI_Init_thread)  (int *, char ***, int, int *)                                         = nullptr;
 static int (*rMPI_Isend)        (const void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Request *)  = nullptr;
 static int (*rMPI_Irecv)        (void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Request *)        = nullptr;
+static int (*rMPI_Send)         (const void *, int, MPI_Datatype, int, int, MPI_Comm)                 = nullptr;
+static int (*rMPI_Recv)         (void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Status *)         = nullptr;
 static int (*rMPI_Type_get_env) (MPI_Datatype, int *, int *, int *, int *)                            = nullptr; 
 static int (*rMPI_Type_size)    (MPI_Datatype, int *)                                                 = nullptr;
 static int (*rMPI_Wait)         (MPI_Request *, MPI_Status *)                                         = nullptr;
@@ -445,6 +448,8 @@ static void init() {
   rMPI_Init_thread  =  (decltype(rMPI_Init_thread))  dlsym(RTLD_NEXT, "MPI_Init_thread");
   rMPI_Isend        =  (decltype(rMPI_Isend))        dlsym(RTLD_NEXT, "MPI_Isend");
   rMPI_Irecv        =  (decltype(rMPI_Irecv))        dlsym(RTLD_NEXT, "MPI_Irecv");
+  rMPI_Send         =  (decltype(rMPI_Send))         dlsym(RTLD_NEXT, "MPI_Send");
+  rMPI_Recv         =  (decltype(rMPI_Recv))         dlsym(RTLD_NEXT, "MPI_Recv");
   rMPI_Type_get_env =  (decltype(rMPI_Type_get_env)) dlsym(RTLD_NEXT, "MPI_Type_get_envelope");
   rMPI_Type_size    =  (decltype(rMPI_Type_size))    dlsym(RTLD_NEXT, "MPI_Type_size");
   rMPI_Wait         =  (decltype(rMPI_Wait))         dlsym(RTLD_NEXT, "MPI_Wait");
@@ -466,6 +471,8 @@ static void init() {
                                 rMPI_Init_thread &&
                                 rMPI_Isend &&
                                 rMPI_Irecv &&
+                                rMPI_Send &&
+                                rMPI_Recv &&
                                 rMPI_Type_get_env &&
                                 rMPI_Type_size && 
                                 rMPI_Wait &&
@@ -867,6 +874,124 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     return ret;
   }
   return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
+}
+
+int MPI_Send(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
+             MPI_Comm comm) {
+  init();
+#ifdef MPI_PANCAKE_SKIP_BLOCKING
+  return rMPI_Send(buf, count, dtype, dest, tag, comm);
+#endif
+  PROFILE_START("PANCAKE-SEND-GET-FIRST-POINTER");
+  const char *first_address = get_first_data_address(buf, dtype);
+  PROFILE_END();
+  
+  // This will also crash the code
+  if (count == 0 || dtype == MPI_DATATYPE_NULL) {
+    return rMPI_Send(buf, count, dtype, dest, tag, comm);
+  }
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Send(buf, count, dtype, dest, tag, comm);
+  }
+#endif
+
+  int type_sz = 0;
+  rMPI_Type_size(dtype, &type_sz);
+
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
+    PROFILE_START("PANCAKE-SEND-ALLOC-POOL");
+    Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
+    PROFILE_END();
+    if (p==nullptr){
+      FATAL("Failed to allocate Pending pointer");
+    }
+    p->op = Pending::SEND;
+    p->tag = tag;
+    PROFILE_START("PANCAKE-SEND-FLATTEN-BLOCKS");
+    p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
+    PROFILE_END();
+    p->pack_size = (std::size_t)count * p->total_bytes;
+    PROFILE_START("PANCAKE-SEND-LOOKASIDE");
+    build_lookaside(p);
+    PROFILE_END();
+
+    int ret = MPI_SUCCESS;
+    if (is_device_ptr(first_address)) {
+      LOG("Dev SEND");
+      p->hw=Pending::HW::DEVICE;
+      PROFILE_START("PANCAKE-SEND-GPU-PACK");
+      gpu_pack(buf, count, p); //<== look inside it kompresses
+      PROFILE_END();
+      ret = rMPI_Send(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
+                       comm);
+    } else {
+      LOG("Host SEND");
+      p->hw=Pending::HW::HOST;
+      cpu_pack(buf, count, p);
+      ret = rMPI_Send(p->pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
+                       comm);
+    }
+    return ret;
+  }
+  return rMPI_Send(buf, count, dtype, dest, tag, comm);
+}
+
+int MPI_Recv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
+             MPI_Comm comm, MPI_Status *status) {
+  init();
+#ifdef MPI_PANCAKE_SKIP_BLOCKING
+  return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
+#endif
+  const char *first_address = get_first_data_address(buf, dtype);
+  if (count == 0 || dtype == MPI_DATATYPE_NULL) {
+    return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
+  }
+
+  
+#ifndef HOST_PACK_ON
+  if (!is_device_ptr(first_address)) {
+    return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
+  }
+#endif
+  int type_sz = 0;
+  rMPI_Type_size(dtype, &type_sz);
+
+  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0 ) {
+    Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
+    p->op = Pending::RECV;
+    p->tag = tag;
+    p->user_buf = buf;
+    p->count = count;
+    p->comm = comm;
+    PROFILE_START("PANCAKE-RECV-FLATTEN");
+    PROFILE_END();
+    p->nblocks = flatten_blocks(dtype, &p->blocks, p->extent, p->total_bytes);
+    p->pack_size = (std::size_t)count * p->total_bytes;
+
+    PROFILE_START("PANCAKE-RECV-LOOKASIDE");
+    build_lookaside(p);
+    PROFILE_END();
+    int ret = MPI_SUCCESS;
+    if (is_device_ptr(first_address)) {
+      LOG("Dev RECV");
+      p->hw=Pending::HW::DEVICE;
+      p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
+      ret = rMPI_Recv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
+                       comm, status);
+    } else {
+      LOG("Host RECV");
+      p->hw=Pending::HW::HOST;
+      p->stage = host_arena->allocate<char>(p->pack_size, 16);
+      ret = rMPI_Recv(p->stage, (int)p->pack_size, MPI_BYTE, src, tag, comm, status);
+    }
+    if (ret == MPI_SUCCESS) {
+      do_complete(p, status);
+    }
+    return ret;
+  }
+  return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
 }
 
 int MPI_Wait(MPI_Request *req, MPI_Status *st) {

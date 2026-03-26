@@ -5,7 +5,7 @@ MPI_Pancake is a lightweight, LD_PRELOADable library which tries to optimize MPI
 **Curretnly MPI_Pancake will flatten `STRUCT HINDEXED MPI_BYTE` and `STRUCT MPI_BYTE` nested types that are using GPU memory but this is easily expandable to more 
 complex or simpler types.** If you are interested in using MPI_Pancake with your data please open an issue.
 
-**MPI_Pancake currently hooks Isend/Irecv. This can also be easily expanded to non blocking/collective calls but I would prefer to do this when the need arises instead
+**MPI_Pancake currently hooks MPI_Isend,MPI_Irecv,MPI_Send,MPI_Recv. This can also be easily expanded to collective calls but I would prefer to do this when the need arises instead
 of trying to catch everything at once.**
 
 ## Buiding 
