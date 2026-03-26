@@ -337,23 +337,19 @@ __global__ void pack_kernel(const char *__restrict__ src,
                             const std::size_t *__restrict__ pref, int nseg,
                             std::size_t extent, std::size_t total_bytes,
                             int count, char *__restrict__ dst) {
-  const auto s_nseg = nseg;
-  const auto s_extent = extent;
-  const auto s_total = total_bytes;
-  const int cell = blockIdx.y;
+  const std::size_t cell = (std::size_t)blockIdx.y;
   if (cell >= count) {
     return;
   }
-  const char *base = src + (std::size_t)cell * s_extent;
-  char *out = dst + (std::size_t)cell * s_total;
-  for (int seg = blockIdx.x; seg < s_nseg; seg += gridDim.x) {
+  const char *base = src + cell * extent;
+  char *out = dst + cell * total_bytes;
+  for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
     const int64_t d = disp[seg];
     const int L = len[seg];
     const std::size_t P = pref[seg];
     const char *sb = base + (std::size_t)d;
     char *db = out + P;
-    std::size_t head = 0;
-    for (std::size_t v = head + (std::size_t)threadIdx.x; v < (std::size_t)L;
+    for (std::size_t v = (std::size_t)threadIdx.x; v < (std::size_t)L;
          v += (std::size_t)blockDim.x) {
       db[v] = sb[v];
     }
@@ -366,24 +362,19 @@ __global__ void unpack_kernel(const char *__restrict__ src,
                               const std::size_t *__restrict__ pref, int nseg,
                               std::size_t extent, std::size_t total_bytes,
                               int count, char *__restrict__ dst) {
-  const auto s_nseg = nseg;
-  const auto s_extent = extent;
-  const auto s_total = total_bytes;
-  const int cell = blockIdx.y;
+  const std::size_t cell = (std::size_t)blockIdx.y;
   if (cell >= count) {
     return;
   }
-  const char *in = src + (std::size_t)cell * s_total;
-  char *obj = dst + (std::size_t)cell * s_extent;
-  for (int seg = blockIdx.x; seg < s_nseg; seg += gridDim.x) {
+  const char *in = src + cell * total_bytes;
+  char *obj = dst + cell * extent;
+  for (int seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
     const int64_t d = disp[seg];
     const int L = len[seg];
     const std::size_t P = pref[seg];
     const char *sb = in + P;
     char *db = obj + (std::size_t)d;
-    std::size_t head = 0;
-
-    for (std::size_t v = head + (std::size_t)threadIdx.x; v < (std::size_t)L;
+    for (std::size_t v = (std::size_t)threadIdx.x; v < (std::size_t)L;
          v += (std::size_t)blockDim.x) {
       db[v] = sb[v];
     }
