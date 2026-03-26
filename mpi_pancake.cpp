@@ -1,5 +1,5 @@
 #if 0 
-hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -I./hipCOMP-core/build/include/ -L./hipCOMP-core/build/lib/  -Wl,-rpath,./hipCOMP-core/build/lib/  -o libmpipancake.so
+hipcc -O3 -std=c++17 -Wno-unused-result -fPIC -shared -x hip mpi_pancake.cpp -ffast-math -march=native -fno-exceptions -o libmpipancake.so
 exit
 #endif
 // clang-format off
