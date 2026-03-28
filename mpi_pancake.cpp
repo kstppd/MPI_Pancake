@@ -431,7 +431,7 @@ void do_unpack(char *user, int count, Pending *p, gpuStream_t s) {
 
 
 static void init() {
-  if (initialized) {
+  if (initialized) [[likely]] {
     return;
   }
   PROFILE_START("PANCAKE-INIT");
@@ -752,14 +752,15 @@ extern "C" {
 int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
-  PROFILE_START("PANCAKE-ISEND-GET-FIRST-POINTER");
-  const char *first_address = get_first_data_address(buf, dtype);
-  PROFILE_END();
   
   // This will also crash the code
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
   }
+  
+  PROFILE_START("PANCAKE-ISEND-GET-FIRST-POINTER");
+  const char *first_address = get_first_data_address(buf, dtype);
+  PROFILE_END();
   
 #ifndef HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
@@ -815,11 +816,16 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
 int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
               MPI_Comm comm, MPI_Request *req) {
   init();
+  
+  // This will also crash the code
+  if (count == 0 || dtype == MPI_DATATYPE_NULL) {
+    return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
+  }
+  
   const char *first_address = get_first_data_address(buf, dtype);
   if (count == 0 || dtype == MPI_DATATYPE_NULL) {
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
-
   
 #ifndef HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
