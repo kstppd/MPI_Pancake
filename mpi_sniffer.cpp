@@ -42,8 +42,8 @@ static std::unordered_map<uint64_t, std::string> _sig_map;
 static std::vector<std::size_t> send_size;
 
 //Hooks
-static int (*realMPI_Init)         (int *, char ***)                                                                                                 = nullptr;
-static int (*realMPI_Init_thread)  (int *, char ***, int, int *)                                                                                     = nullptr;
+static int (*real_MPI_Init)               (int *, char ***)                                                                                        = nullptr;
+static int (*real_MPI_Init_thread)        (int *, char ***, int, int *)                                                                            = nullptr;
 static int (*real_MPI_Send)              (const void *, int, MPI_Datatype, int, int, MPI_Comm)                                                    = nullptr;
 static int (*real_MPI_Isend)             (const void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Request *)                                     = nullptr;
 static int (*real_MPI_Recv)              (void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Status *)                                            = nullptr;
@@ -63,19 +63,31 @@ static void init() {
   std::lock_guard<std::mutex> lk(_m);
   if (initialized) {
     return;
-  realMPI_Init         =  (decltype(realMPI_Init))         dlsym(RTLD_NEXT, "MPI_Init");
-  realMPI_Init_thread  =  (decltype(realMPI_Init_thread))  dlsym(RTLD_NEXT, "MPI_Init_thread"); }
-  real_MPI_Send = (decltype(real_MPI_Send))dlsym(RTLD_NEXT, "MPI_Send");
-  real_MPI_Isend =     (decltype(real_MPI_Isend))dlsym(RTLD_NEXT, "MPI_Isend");
-  real_MPI_Recv =      (decltype(real_MPI_Recv))dlsym(RTLD_NEXT, "MPI_Recv");
-  real_MPI_Irecv =     (decltype(real_MPI_Irecv))dlsym(RTLD_NEXT, "MPI_Irecv");
-  real_MPI_Type_get_envelope = (decltype(real_MPI_Type_get_envelope))dlsym(RTLD_NEXT, "MPI_Type_get_envelope");
-  real_MPI_Type_size = (decltype(real_MPI_Type_size))dlsym(RTLD_NEXT, "MPI_Type_size");
-  real_MPI_Finalize =  (decltype(real_MPI_Finalize))dlsym(RTLD_NEXT, "MPI_Finalize");
-  real_MPI_Comm_rank = (decltype(real_MPI_Comm_rank))dlsym(RTLD_NEXT, "MPI_Comm_rank");
-  real_MPI_Comm_size = (decltype(real_MPI_Comm_size))dlsym(RTLD_NEXT, "MPI_Comm_size");
-  real_MPI_Gather    = (decltype(real_MPI_Gather))dlsym(RTLD_NEXT, "MPI_Gather");
-  real_MPI_Gatherv   = (decltype(real_MPI_Gatherv))dlsym(RTLD_NEXT, "MPI_Gatherv");
+  }
+  real_MPI_Init                 =      (decltype(real_MPI_Init))                 dlsym(RTLD_NEXT, "MPI_Init");
+  real_MPI_Init_thread          =      (decltype(real_MPI_Init_thread))          dlsym(RTLD_NEXT, "MPI_Init_thread"); 
+  real_MPI_Send                 =      (decltype(real_MPI_Send))                 dlsym(RTLD_NEXT, "MPI_Send");
+  real_MPI_Isend                =      (decltype(real_MPI_Isend))                dlsym(RTLD_NEXT, "MPI_Isend");
+  real_MPI_Recv                 =      (decltype(real_MPI_Recv))                 dlsym(RTLD_NEXT, "MPI_Recv");
+  real_MPI_Irecv                =      (decltype(real_MPI_Irecv))                dlsym(RTLD_NEXT, "MPI_Irecv");
+  real_MPI_Type_get_envelope    =      (decltype(real_MPI_Type_get_envelope))    dlsym(RTLD_NEXT, "MPI_Type_get_envelope");
+  real_MPI_Type_size            =      (decltype(real_MPI_Type_size))            dlsym(RTLD_NEXT, "MPI_Type_size");
+  real_MPI_Finalize             =      (decltype(real_MPI_Finalize))             dlsym(RTLD_NEXT, "MPI_Finalize");
+  real_MPI_Comm_rank            =      (decltype(real_MPI_Comm_rank))            dlsym(RTLD_NEXT, "MPI_Comm_rank");
+  real_MPI_Comm_size            =      (decltype(real_MPI_Comm_size))            dlsym(RTLD_NEXT, "MPI_Comm_size");
+  real_MPI_Gather               =      (decltype(real_MPI_Gather))               dlsym(RTLD_NEXT, "MPI_Gather");
+  real_MPI_Gatherv              =      (decltype(real_MPI_Gatherv))              dlsym(RTLD_NEXT, "MPI_Gatherv");
+  const bool are_all_hooks_ok = real_MPI_Init &&
+                                real_MPI_Init_thread &&
+                                real_MPI_Isend &&
+                                real_MPI_Irecv &&
+                                real_MPI_Send &&
+                                real_MPI_Recv ;
+
+  if (!are_all_hooks_ok){
+    fprintf(stderr,"ERROR:Some hook could not be dlopened!\n");
+    abort();
+  }
   initialized = true;
 }
 
@@ -259,12 +271,12 @@ static std::string format_num_bytes(size_t num_bytes) {
 extern "C"{
 int MPI_Init(int *argc, char ***argv) {
   init();
-  return realMPI_Init(argc, argv);
+  return real_MPI_Init(argc, argv);
 }
 
 int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
   init();
-  return realMPI_Init_thread(argc, argv, required, provided);
+  return real_MPI_Init_thread(argc, argv, required, provided);
 }
 
 int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest,
