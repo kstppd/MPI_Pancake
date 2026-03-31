@@ -42,6 +42,8 @@ static std::unordered_map<uint64_t, std::string> _sig_map;
 static std::vector<std::size_t> send_size;
 
 //Hooks
+static int (*realMPI_Init)         (int *, char ***)                                                                                                 = nullptr;
+static int (*realMPI_Init_thread)  (int *, char ***, int, int *)                                                                                     = nullptr;
 static int (*real_MPI_Send)              (const void *, int, MPI_Datatype, int, int, MPI_Comm)                                                    = nullptr;
 static int (*real_MPI_Isend)             (const void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Request *)                                     = nullptr;
 static int (*real_MPI_Recv)              (void *, int, MPI_Datatype, int, int, MPI_Comm, MPI_Status *)                                            = nullptr;
@@ -61,7 +63,8 @@ static void init() {
   std::lock_guard<std::mutex> lk(_m);
   if (initialized) {
     return;
-  }
+  realMPI_Init         =  (decltype(realMPI_Init))         dlsym(RTLD_NEXT, "MPI_Init");
+  realMPI_Init_thread  =  (decltype(realMPI_Init_thread))  dlsym(RTLD_NEXT, "MPI_Init_thread"); }
   real_MPI_Send = (decltype(real_MPI_Send))dlsym(RTLD_NEXT, "MPI_Send");
   real_MPI_Isend =     (decltype(real_MPI_Isend))dlsym(RTLD_NEXT, "MPI_Isend");
   real_MPI_Recv =      (decltype(real_MPI_Recv))dlsym(RTLD_NEXT, "MPI_Recv");
@@ -253,6 +256,17 @@ static std::string format_num_bytes(size_t num_bytes) {
   return oss.str();
 }
 
+extern "C"{
+int MPI_Init(int *argc, char ***argv) {
+  init();
+  return realMPI_Init(argc, argv);
+}
+
+int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
+  init();
+  return realMPI_Init_thread(argc, argv, required, provided);
+}
+
 int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest,
              int tag, MPI_Comm comm) {
   init();
@@ -308,6 +322,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source, int tag,
   irecv_stats[key].num_calls++;
   irecv_stats[key].num_bytes += (size_t)count * (size_t)type_size_num_bytes;
   return real_MPI_Irecv(buf, count, datatype, source, tag, comm, request);
+}
 }
 
 struct CommStat {
