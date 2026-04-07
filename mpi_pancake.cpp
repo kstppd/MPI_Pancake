@@ -996,20 +996,6 @@ int MPI_Wait(MPI_Request *req, MPI_Status *st) {
   return complete_request(req, st);
 }
 
-// // TODO is it ok if I thread this and lock the pendig map?
-// int MPI_Waitall_(int n, MPI_Request reqs[], MPI_Status stats[]) {
-//   init();
-//   int err = MPI_SUCCESS;
-//   for (int i = 0; i < n; i++) {
-//     MPI_Status *st =
-//         (stats == MPI_STATUSES_IGNORE) ? MPI_STATUS_IGNORE : &stats[i];
-//     int e = complete_request(&reqs[i], st);
-//     if (e != MPI_SUCCESS && err == MPI_SUCCESS)
-//       err = e;
-//   }
-//   return err;
-// }
-//
 int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
   init();
   struct Comm {
