@@ -321,8 +321,8 @@ static int (*rMPI_Finalize)     (void)                                          
 
 // SETTINGS
 static constexpr std::size_t POOL = 8ull * 1024ull * 1024ull * 1024ull;
-static constexpr std::size_t INIT_MAP_CAPACITY = 1<<12;
-static constexpr std::size_t INIT_BLOCKS = 8 * 512;
+static constexpr std::size_t INIT_MAP_CAPACITY = 1<<20;
+static constexpr std::size_t INIT_BLOCKS = 32 * 512;
 //~SETTINGS
 static BumpAllocator *host_arena = nullptr;
 static BumpAllocator *dev_arena = nullptr;
