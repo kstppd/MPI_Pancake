@@ -488,33 +488,36 @@ static void init() {
 
 static inline bool is_device_ptr(const void *ptr) {
   PROFILE_START("PANCAKE-POINTER-QUERY");
-#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__) 
+  if (ptr == nullptr) {
+    PROFILE_END();
+    return false;
+  }
+
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
   hipPointerAttribute_t attr;
   hipError_t err = hipPointerGetAttributes(&attr, ptr);
   if (err != hipSuccess) {
     hipGetLastError();
-    FATAL("COULD NOT DETECT POINTER");
+    PROFILE_END();
     return false;
   }
+  bool result =
+      attr.type == hipMemoryTypeDevice || attr.type == hipMemoryTypeManaged;
   PROFILE_END();
-  return (attr.type == hipMemoryTypeDevice ||
-          attr.type == hipMemoryTypeManaged);
-
+  return result;
 #else
   cudaPointerAttributes attr;
   cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
   if (err != cudaSuccess) {
     cudaGetLastError();
-    FATAL("COULD NOT DETECT POINTER");
+    PROFILE_END();
     return false;
   }
-
-  bool result = false;
 #if CUDART_VERSION >= 10000
-  result =
-      (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged);
+  bool result =
+      attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
 #else
-  result = (attr.memoryType == cudaMemoryTypeDevice);
+  bool result = attr.memoryType == cudaMemoryTypeDevice;
 #endif
   PROFILE_END();
   return result;
