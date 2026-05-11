@@ -148,6 +148,7 @@ Status for Vlasiator comms:
 #endif
 
 #define MPI_PANCAKE_SKIP_BLOCKING
+// #define MPI_PANCAKE_HOST_PACK_ON
 #ifndef VERBOSE
 #define LOG(...)                                                               \
   do {                                                                         \
@@ -765,7 +766,7 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
   const char *first_address = get_first_data_address(buf, dtype);
   PROFILE_END();
   
-#ifndef HOST_PACK_ON
+#ifndef MPI_PANCAKE_HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
     return rMPI_Isend(buf, count, dtype, dest, tag, comm, req);
   }
@@ -830,7 +831,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
   
-#ifndef HOST_PACK_ON
+#ifndef MPI_PANCAKE_HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
@@ -891,7 +892,7 @@ int MPI_Send(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
     return rMPI_Send(buf, count, dtype, dest, tag, comm);
   }
   
-#ifndef HOST_PACK_ON
+#ifndef MPI_PANCAKE_HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
     return rMPI_Send(buf, count, dtype, dest, tag, comm);
   }
@@ -950,7 +951,7 @@ int MPI_Recv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
   }
 
   
-#ifndef HOST_PACK_ON
+#ifndef MPI_PANCAKE_HOST_PACK_ON
   if (!is_device_ptr(first_address)) {
     return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
   }
