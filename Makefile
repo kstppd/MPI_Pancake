@@ -17,7 +17,6 @@ else
     $(error No backend specified: USE_CUDA=1 or USE_HIP=1)
 endif
 
-
 CFLAGS += -Xcompiler="$(MPI_CFLAGS)"
 .PHONY: all clean
 
