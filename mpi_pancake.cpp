@@ -752,6 +752,15 @@ static int complete_request(MPI_Request *req, MPI_Status *st) {
   return ret;
 }
 
+bool should_pack_type(MPI_Datatype dtype) {
+  int type_sz = 0;
+  rMPI_Type_size(dtype, &type_sz);
+  if (type_sz > 0 && get_combiner(dtype) == MPI_COMBINER_STRUCT) {
+    return true;
+  }
+  return false;
+}
+
 extern "C" {
 int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
               MPI_Comm comm, MPI_Request *req) {
@@ -772,10 +781,7 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
   }
 #endif
 
-  int type_sz = 0;
-  rMPI_Type_size(dtype, &type_sz);
-
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (should_pack_type(dtype)) {
     PROFILE_START("PANCAKE-ISEND-ALLOC-POOL");
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     PROFILE_END();
@@ -836,10 +842,8 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     return rMPI_Irecv(buf, count, dtype, src, tag, comm, req);
   }
 #endif
-  int type_sz = 0;
-  rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (should_pack_type(dtype)) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     p->op = Pending::RECV;
     p->tag = tag;
@@ -898,10 +902,7 @@ int MPI_Send(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
   }
 #endif
 
-  int type_sz = 0;
-  rMPI_Type_size(dtype, &type_sz);
-
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (should_pack_type(dtype)) {
     PROFILE_START("PANCAKE-SEND-ALLOC-POOL");
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     PROFILE_END();
@@ -955,10 +956,8 @@ int MPI_Recv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
     return rMPI_Recv(buf, count, dtype, src, tag, comm, status);
   }
 #endif
-  int type_sz = 0;
-  rMPI_Type_size(dtype, &type_sz);
 
-  if (get_combiner(dtype) == MPI_COMBINER_STRUCT && type_sz > 0) {
+  if (should_pack_type(dtype)) {
     Pending *p = ::new (host_arena->allocate<Pending>(1)) Pending{};
     p->op = Pending::RECV;
     p->tag = tag;
