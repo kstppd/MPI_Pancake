@@ -1,5 +1,5 @@
 ## MPI Pancake 
-MPI_Pancake is a lightweight, LD_PRELOADable library which tries to optimize MPI GPU communications from MPI_Derived types by hooking MPI_Isend and MPI_Irecv calls and then performing GPU packing and unpacking. The library is developed for Vlasiator but can be used with all kind of software that do MPI comms with GPU data (especially those using MPI Derived types).
+MPI_Pancake is a lightweight, LD_PRELOADable library which tries to optimize MPI GPU communications from MPI_Derived types by hooking MPI_Isend and MPI_Irecv calls and then performing GPU packing and unpacking. MPI_Pancake can be used with C,C++ and Fortran. The library is developed for Vlasiator but can be used with all kind of software that do MPI comms with GPU data (especially those using MPI Derived types).
 
 ### Limitations
 **Curretnly MPI_Pancake will flatten `STRUCT HINDEXED MPI_BYTE` and `STRUCT MPI_BYTE` nested types that are using GPU memory but this is easily expandable to more 
