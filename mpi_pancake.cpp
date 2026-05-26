@@ -1072,4 +1072,106 @@ int MPI_Finalize(void) {
   return rMPI_Finalize();
 }
 
+// Fortran interface
+void mpi_isend_(void *buf, int *count, MPI_Fint *ftype, int *dest, int *tag,
+                MPI_Fint *fcomm, MPI_Fint *freq, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Request creq;
+  *ierr = MPI_Isend(buf, *count, dtype, *dest, *tag, comm, &creq);
+  *freq = MPI_Request_c2f(creq);
+}
+
+void mpi_irecv_(void *buf, int *count, MPI_Fint *ftype, int *src, int *tag,
+                MPI_Fint *fcomm, MPI_Fint *freq, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Request creq;
+  *ierr = MPI_Irecv(buf, *count, dtype, *src, *tag, comm, &creq);
+  *freq = MPI_Request_c2f(creq);
+}
+
+void mpi_send_(void *buf, int *count, MPI_Fint *ftype, int *dest, int *tag,
+               MPI_Fint *fcomm, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  *ierr = MPI_Send(buf, *count, dtype, *dest, *tag, comm);
+}
+
+void mpi_recv_(void *buf, int *count, MPI_Fint *ftype, int *src, int *tag,
+               MPI_Fint *fcomm, MPI_Fint *fstatus, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Status cstatus;
+  *ierr = MPI_Recv(buf, *count, dtype, *src, *tag, comm, &cstatus);
+  if (fstatus != nullptr) {
+    MPI_Status_c2f(&cstatus, fstatus);
+  }
+}
+
+void mpi_wait_(MPI_Fint *freq, MPI_Fint *fstatus, int *ierr) {
+  MPI_Request creq = MPI_Request_f2c(*freq);
+  MPI_Status cstatus;
+  *ierr = MPI_Wait(&creq, &cstatus);
+  *freq = MPI_Request_c2f(creq);
+  if (fstatus != nullptr) {
+    MPI_Status_c2f(&cstatus, fstatus);
+  }
+}
+
+void mpi_isend_f08_(void *buf, int *count, MPI_Fint *ftype, int *dest, int *tag,
+                    MPI_Fint *fcomm, MPI_Fint *freq, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Request creq;
+  *ierr = MPI_Isend(buf, *count, dtype, *dest, *tag, comm, &creq);
+  *freq = MPI_Request_c2f(creq);
+}
+
+void mpi_irecv_f08_(void *buf, int *count, MPI_Fint *ftype, int *src, int *tag,
+                    MPI_Fint *fcomm, MPI_Fint *freq, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Request creq;
+  *ierr = MPI_Irecv(buf, *count, dtype, *src, *tag, comm, &creq);
+  *freq = MPI_Request_c2f(creq);
+}
+
+void mpi_send_f08_(void *buf, int *count, MPI_Fint *ftype, int *dest, int *tag,
+                   MPI_Fint *fcomm, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  *ierr = MPI_Send(buf, *count, dtype, *dest, *tag, comm);
+}
+
+void mpi_recv_f08_(void *buf, int *count, MPI_Fint *ftype, int *src, int *tag,
+                   MPI_Fint *fcomm, MPI_Fint *fstatus, int *ierr) {
+  MPI_Datatype dtype = MPI_Type_f2c(*ftype);
+  MPI_Comm comm = MPI_Comm_f2c(*fcomm);
+  MPI_Status cstatus;
+  *ierr = MPI_Recv(buf, *count, dtype, *src, *tag, comm, &cstatus);
+  if (fstatus != nullptr) {
+    MPI_Status_c2f(&cstatus, fstatus);
+  }
+}
+
+void mpi_wait_f08_(MPI_Fint *freq, MPI_Fint *fstatus, int *ierr) {
+  MPI_Request creq = MPI_Request_f2c(*freq);
+  MPI_Status cstatus;
+  *ierr = MPI_Wait(&creq, &cstatus);
+  *freq = MPI_Request_c2f(creq);
+  if (fstatus != nullptr) {
+    MPI_Status_c2f(&cstatus, fstatus);
+  }
+}
+
+void mpi_init_f08_(int *ierr) {
+  int argc = 0;
+  char **argv = nullptr;
+  *ierr = MPI_Init(&argc, &argv);
+}
+
+void mpi_finalize_(int *ierr) { *ierr = MPI_Finalize(); }
+void mpi_finalize_f08_(int *ierr) { *ierr = MPI_Finalize(); }
+
 } // extern "C"
