@@ -331,6 +331,9 @@ static bool initialized = false;
 static gpuStream_t s = nullptr;
 static std::unordered_map<MPI_Request, Pending *> pending;
 
+extern "C" std::size_t get_pool_size() {
+  return POOL;
+}
 
 __global__ void pack_kernel(const char *__restrict__ src,
                             const int64_t *__restrict__ disp,
