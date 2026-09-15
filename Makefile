@@ -6,12 +6,12 @@ BIN = libmpipancake.so
 
 ifeq ($(USE_CUDA), 1)
     CC      := nvcc
-    CFLAGS  := -ccbin mpicxx -DNOPROFILE -O3 -std=c++17 -Xcompiler="-fPIC  -Wall -Wextra -march=native -O3 " -x cu
-    LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)" 
+    CFLAGS  := -ccbin mpicxx -DNOPROFILE -O3 -std=c++17 -Xcompiler="-fPIC -Wall -Wextra -march=native -O3" -x cu --use_fast_math -gencode arch=compute_90a,code=sm_90a --diag-suppress=68
+    LDFLAGS := -Xcompiler="$(MPI_LDFLAGS)" -lnccl
 else ifeq ($(USE_HIP), 1)
     CC      := hipcc
     CFLAGS  := -O3 -DNOPROFILE -std=c++17 -fPIC -ffast-math -Wall -Werror -Wextra -x hip
-    LDFLAGS := -$(MPI_LDFLAGS)
+    LDFLAGS := -$(MPI_LDFLAGS) -lrccl
     CFLAGS += --offload-arch=$(HIP_ARCH)
 else
     $(error No backend specified: USE_CUDA=1 or USE_HIP=1)
