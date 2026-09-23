@@ -126,6 +126,7 @@ Status for Vlasiator comms:
 */
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <unordered_map>
@@ -237,6 +238,20 @@ do {                                                                         \
 #define gpuGetErrorString(e)                cudaGetErrorString(e)
 #endif
 
+#if defined(__HIPCC__) || defined(USE_HIP)
+#include <rccl/rccl.h>
+#else
+#include <nccl.h>
+#endif
+
+#define NCCL_CHECK(cmd)                                                        \
+  do {                                                                         \
+    ncclResult_t _r = (cmd);                                                   \
+    if (_r != ncclSuccess) {                                                   \
+      FATAL("NCCL Error: %s", ncclGetErrorString(_r));                         \
+    }                                                                          \
+  } while (0)
+
 // Stolen from AST_Picasso@Graffathon 2025
 struct BumpAllocator {
   void *mem = nullptr;
@@ -282,6 +297,7 @@ struct SOABlock {
 struct Pending {
   enum Op { SEND, RECV } op;
   enum HW { HOST,DEVICE} hw;
+  enum Transport { MPI, NCCL } transport = MPI;
   MPI_Request rreq{};
   SOABlock *blocks = nullptr;
   std::size_t nblocks = 0;
@@ -330,6 +346,8 @@ static BumpAllocator *dev_arena = nullptr;
 static bool initialized = false;
 static gpuStream_t s = nullptr;
 static std::unordered_map<MPI_Request, Pending *> pending;
+static ncclComm_t nccl_comm = nullptr;
+static bool nccl_initialized = false;
 
 extern "C" std::size_t get_pool_size() {
   return POOL;
@@ -385,7 +403,7 @@ __global__ void unpack_kernel(const char *__restrict__ src,
   }
 }
 
-void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
+static void do_pack(const char *user, int count, Pending *p, gpuStream_t s) {
   std::size_t avg = (p->nblocks ? p->total_bytes / p->nblocks : p->total_bytes);
   int tpb = (avg >= 4096 ? 256 : (avg >= 1024 ? 128 : 64));
   dim3 block(tpb);
@@ -439,6 +457,21 @@ static void init() {
     return;
   }
   PROFILE_START("PANCAKE-INIT");
+  {
+    const char *lid = getenv("SLURM_LOCALID");
+    if (!lid) lid = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    if (!lid) lid = getenv("MV2_COMM_WORLD_LOCAL_RANK");
+    if (lid) {
+      int ndev = 0, lrank = atoi(lid);
+#if defined(__HIPCC__) || defined(USE_HIP)
+      if (hipGetDeviceCount(&ndev) == hipSuccess && ndev > 1)
+        hipSetDevice(lrank % ndev);
+#else
+      if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 1)
+        cudaSetDevice(lrank % ndev);
+#endif
+    }
+  }
   rMPI_Init         =  (decltype(rMPI_Init))         dlsym(RTLD_NEXT, "MPI_Init");
   rMPI_Init_thread  =  (decltype(rMPI_Init_thread))  dlsym(RTLD_NEXT, "MPI_Init_thread");
   rMPI_Isend        =  (decltype(rMPI_Isend))        dlsym(RTLD_NEXT, "MPI_Isend");
@@ -487,6 +520,18 @@ static void init() {
   fprintf(stdout,"========= MPI_PANCAKE Initialized =========\n");
   PROFILE_END();
   return;
+}
+
+static void init_nccl() {
+  if (nccl_initialized) return;
+  int rank = 0, size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  ncclUniqueId nccl_id;
+  if (rank == 0) NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+  MPI_Bcast(&nccl_id, sizeof(ncclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+  NCCL_CHECK(ncclCommInitRank(&nccl_comm, size, nccl_id, rank));
+  nccl_initialized = true;
 }
 // clang-format on
 
@@ -555,21 +600,115 @@ static MPI_Datatype unwrap_datatype(MPI_Datatype t) {
   return t;
 }
 
-/*
-There is a big assumption made here. What comes in
- is guaranteed to be an MPI_STRUCT that has children (dynamically sized)
- of type MPI_HINDEXED OR MPI_BYTE/NAMED.
-*/
-static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
-                                  MPI_Aint &extent, std::size_t &total_bytes) {
+// Requires  SUBARRAY->CONTIGUOUS->BYTE
+static std::size_t flatten_subarray_blocks(MPI_Datatype dtype, SOABlock *out,
+                                           std::size_t &total_bytes) {
   std::size_t nb = 0;
-  *out = host_arena->allocate<SOABlock>(INIT_BLOCKS);
-  dtype = unwrap_datatype(dtype);
-  MPI_Aint lb = 0;
-  if (MPI_Type_get_extent(dtype, &lb, &extent) != MPI_SUCCESS) {
-    FATAL("ERROR: Could not get MPI extent!");
+  int ni = 0, na = 0, nt = 0, comb = 0;
+  if (rMPI_Type_get_env(dtype, &ni, &na, &nt, &comb) != MPI_SUCCESS ||
+      comb != MPI_COMBINER_SUBARRAY || nt != 1) {
+    FATAL("ERROR: Could not get MPI envelope for SUBARRAY datatype!");
+  }
+  auto *ints = host_arena->allocate<int>(ni);
+  auto *addrs = host_arena->allocate<MPI_Aint>(na);
+  auto *types = host_arena->allocate<MPI_Datatype>(nt);
+  if (MPI_Type_get_contents(dtype, ni, na, nt, ints, addrs, types) !=
+      MPI_SUCCESS) {
+    FATAL("ERROR: Could not get MPI contents for SUBARRAY datatype!");
   }
 
+  const int ndims = ints[0];
+  const int *sizes = &ints[1];
+  const int *subsizes = &ints[1 + ndims];
+  const int *starts = &ints[1 + 2 * ndims];
+  const int order = ints[1 + 3 * ndims];
+  const MPI_Datatype oldtype = types[0];
+
+  int oi = 0, oa = 0, ot = 0, ocomb = 0;
+  if (rMPI_Type_get_env(oldtype, &oi, &oa, &ot, &ocomb) != MPI_SUCCESS ||
+      ocomb != MPI_COMBINER_CONTIGUOUS || ot != 1) {
+    FATAL("We should have never ended up here in Vlasiator! SUBARRAY's "
+          "oldtype must be CONTIGUOUS->MPI_BYTE!");
+  }
+  auto *oints = host_arena->allocate<int>(oi);
+  auto *oaddrs = host_arena->allocate<MPI_Aint>(oa);
+  auto *otypes = host_arena->allocate<MPI_Datatype>(ot);
+  if (MPI_Type_get_contents(oldtype, oi, oa, ot, oints, oaddrs, otypes) !=
+      MPI_SUCCESS) {
+    FATAL("ERROR: Could not get MPI contents for SUBARRAY's oldtype!");
+  }
+  if (otypes[0] != MPI_BYTE) {
+    FATAL("We should have never ended up here in Vlasiator! SUBARRAY's "
+          "oldtype must wrap MPI_BYTE!");
+  }
+  const std::size_t elem_size = (std::size_t)oints[0];
+
+  auto *stride = host_arena->allocate<int64_t>(ndims);
+  if (order == MPI_ORDER_C) {
+    stride[ndims - 1] = 1;
+    for (int i = ndims - 2; i >= 0; i--) {
+      stride[i] = stride[i + 1] * (int64_t)sizes[i + 1];
+    }
+  } else {
+    stride[0] = 1;
+    for (int i = 1; i < ndims; i++) {
+      stride[i] = stride[i - 1] * (int64_t)sizes[i - 1];
+    }
+  }
+  const int fastest = (order == MPI_ORDER_C) ? (ndims - 1) : 0;
+
+  int64_t base_off = 0;
+  for (int i = 0; i < ndims; i++) {
+    base_off += (int64_t)starts[i] * stride[i];
+  }
+
+  total_bytes = 0;
+  const std::size_t run_len = (std::size_t)subsizes[fastest] * elem_size;
+
+  auto *idx = host_arena->allocate<int>(ndims);
+  for (int i = 0; i < ndims; i++) {
+    idx[i] = 0;
+  }
+  while (true) {
+    int64_t off = base_off;
+    for (int i = 0; i < ndims; i++) {
+      if (i != fastest) {
+        off += (int64_t)idx[i] * stride[i];
+      }
+    }
+    SOABlock b{(MPI_Aint)(off * (int64_t)elem_size), (int)run_len, total_bytes};
+    total_bytes += run_len;
+    out[nb++] = b;
+
+    int d = ndims - 1;
+    while (true) {
+      if (d < 0) {
+        goto done;
+      }
+      if (d == fastest) {
+        d--;
+        continue;
+      }
+      idx[d]++;
+      if (idx[d] < subsizes[d]) {
+        break;
+      }
+      idx[d] = 0;
+      d--;
+    }
+  }
+done:
+
+  if (nb > INIT_BLOCKS) {
+    host_arena->unsafe_extend_allocation<SOABlock>(nb - INIT_BLOCKS);
+  }
+  return nb;
+}
+
+// Requires  STRUCT->HINDEXED->BYTE
+static std::size_t flatten_struct_blocks(MPI_Datatype dtype, SOABlock *out,
+                                         std::size_t &total_bytes) {
+  std::size_t nb = 0;
   int ni = 0, na = 0, nt = 0, comb = 0;
   if (rMPI_Type_get_env(dtype, &ni, &na, &nt, &comb) != MPI_SUCCESS) {
     FATAL("ERROR: Could not get MPI envelope!");
@@ -586,7 +725,6 @@ static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
   const int *struct_blks = &ints[1];
 
   total_bytes = 0;
-
   for (int c = 0; c < nchildren; c++) {
     MPI_Datatype ctype = unwrap_datatype(types[c]);
     int si = 0, sa = 0, st = 0, sc = 0;
@@ -610,7 +748,7 @@ static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
       for (int i = 0; i < subcount; i++) {
         SOABlock b{addrs[c] + saddrs[i], lens[i], total_bytes};
         total_bytes += (std::size_t)lens[i];
-        (*out)[nb++] = b;
+        out[nb++] = b;
       }
 
     } else if (sc == MPI_COMBINER_NAMED) {
@@ -624,7 +762,7 @@ static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
         const std::size_t L = (std::size_t)bl * (std::size_t)child_sz;
         SOABlock b{addrs[c], (int)L, total_bytes};
         total_bytes += L;
-        (*out)[nb++] = b;
+        out[nb++] = b;
       }
     } else {
       FATAL("We should have never ended up here in Vlasiator! That means we "
@@ -637,6 +775,32 @@ static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
     host_arena->unsafe_extend_allocation<SOABlock>(nb - INIT_BLOCKS);
   }
   return nb;
+}
+
+/*
+This works with either:
+  MPI_STRUCT->HINDEXED->MPI_BYTE 
+  MPI_SUBARRAY->CONTIGUOUS->MPI_BYTE
+*/
+static std::size_t flatten_blocks(MPI_Datatype dtype, SOABlock **out,
+                                  MPI_Aint &extent, std::size_t &total_bytes) {
+  *out = host_arena->allocate<SOABlock>(INIT_BLOCKS);
+  dtype = unwrap_datatype(dtype);
+  MPI_Aint lb = 0;
+  if (MPI_Type_get_extent(dtype, &lb, &extent) != MPI_SUCCESS) {
+    FATAL("ERROR: Could not get MPI extent!");
+  }
+
+  const int comb = get_combiner(dtype);
+  if (comb == MPI_COMBINER_SUBARRAY) {
+    return flatten_subarray_blocks(dtype, *out, total_bytes);
+  }
+  if (comb == MPI_COMBINER_STRUCT) {
+    return flatten_struct_blocks(dtype, *out, total_bytes);
+  }
+  FATAL("We should have never ended up here in Vlasiator! Unsupported "
+        "top-level datatype combiner!");
+  return 0;
 }
 
 static void build_lookaside(Pending *p) {
@@ -738,11 +902,19 @@ static int complete_request(MPI_Request *req, MPI_Status *st) {
     return rMPI_Wait(req, st);
   }
   Pending *p = it->second;
-  int ret = rMPI_Wait(&p->rreq, st);
-  if (ret == MPI_SUCCESS) {
+  int ret = MPI_SUCCESS;
+  if (p->transport == Pending::NCCL) {
+    gpuStreamSynchronize(s);
     PROFILE_START("PANCAKE-DO-COMPLETE");
     do_complete(p, st);
     PROFILE_END();
+  } else {
+    ret = rMPI_Wait(&p->rreq, st);
+    if (ret == MPI_SUCCESS) {
+      PROFILE_START("PANCAKE-DO-COMPLETE");
+      do_complete(p, st);
+      PROFILE_END();
+    }
   }
   pending.erase(it);
   *req = MPI_REQUEST_NULL;
@@ -755,13 +927,14 @@ static int complete_request(MPI_Request *req, MPI_Status *st) {
   return ret;
 }
 
-bool should_pack_type(MPI_Datatype dtype) {
+static bool should_pack_type(MPI_Datatype dtype) {
   int type_sz = 0;
   rMPI_Type_size(dtype, &type_sz);
-  if (type_sz > 0 && get_combiner(dtype) == MPI_COMBINER_STRUCT) {
-    return true;
+  if (type_sz <= 0) {
+    return false;
   }
-  return false;
+  const int comb = get_combiner(dtype);
+  return comb == MPI_COMBINER_STRUCT || comb == MPI_COMBINER_SUBARRAY;
 }
 
 extern "C" {
@@ -806,10 +979,17 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
       LOG("Dev SEND");
       p->hw = Pending::HW::DEVICE;
       PROFILE_START("PANCAKE-ISEND-GPU-PACK");
-      gpu_pack(buf, count, p); //<== look inside it kompresses
+      gpu_pack(buf, count, p);
       PROFILE_END();
-      ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
-                       comm, &p->rreq);
+      if (nccl_initialized && comm == MPI_COMM_WORLD) {
+        p->transport = Pending::NCCL;
+        NCCL_CHECK(ncclGroupStart());
+        NCCL_CHECK(ncclSend(p->d_pack_buffer, p->pack_size, ncclInt8, dest, nccl_comm, s));
+        NCCL_CHECK(ncclGroupEnd());
+      } else {
+        ret = rMPI_Isend(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
+                         comm, &p->rreq);
+      }
     } else {
       LOG("Host SEND");
       p->hw = Pending::HW::HOST;
@@ -817,7 +997,11 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype dtype, int dest, int tag,
       ret = rMPI_Isend(p->pack_buffer, (int)p->pack_size, MPI_BYTE, dest, tag,
                        comm, &p->rreq);
     }
-    if (ret == MPI_SUCCESS) {
+    if (p->transport == Pending::NCCL) {
+      MPI_Request fake = reinterpret_cast<MPI_Request>(p);
+      *req = fake;
+      pending[fake] = p;
+    } else if (ret == MPI_SUCCESS) {
       *req = p->rreq;
       pending[p->rreq] = p;
     }
@@ -866,8 +1050,15 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
       LOG("Dev RECV");
       p->hw = Pending::HW::DEVICE;
       p->d_pack_buffer = dev_arena->allocate<char>(p->pack_size, 256);
-      ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
-                       comm, &p->rreq);
+      if (nccl_initialized && comm == MPI_COMM_WORLD && src != MPI_ANY_SOURCE) {
+        p->transport = Pending::NCCL;
+        NCCL_CHECK(ncclGroupStart());
+        NCCL_CHECK(ncclRecv(p->d_pack_buffer, p->pack_size, ncclInt8, src, nccl_comm, s));
+        NCCL_CHECK(ncclGroupEnd());
+      } else {
+        ret = rMPI_Irecv(p->d_pack_buffer, (int)p->pack_size, MPI_BYTE, src, tag,
+                         comm, &p->rreq);
+      }
     } else {
       LOG("Host RECV");
       p->hw = Pending::HW::HOST;
@@ -875,7 +1066,11 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype dtype, int src, int tag,
       ret = rMPI_Irecv(p->stage, (int)p->pack_size, MPI_BYTE, src, tag, comm,
                        &p->rreq);
     }
-    if (ret == MPI_SUCCESS) {
+    if (p->transport == Pending::NCCL) {
+      MPI_Request fake = reinterpret_cast<MPI_Request>(p);
+      *req = fake;
+      pending[fake] = p;
+    } else if (ret == MPI_SUCCESS) {
       *req = p->rreq;
       pending[p->rreq] = p;
     }
@@ -1007,17 +1202,26 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
   struct Comm {
     int id;
     MPI_Request r;
+    bool is_nccl;
   };
   Comm *comms_list = host_arena->allocate<Comm>(n);
   std::size_t comms_count = 0;
+  bool has_nccl = false;
   for (int i = 0; i < n; ++i) {
     auto it = pending.find(reqs[i]);
     if (it != pending.end()) {
-      comms_list[comms_count] = Comm{i, reqs[i]};
-      comms_count++;
+      bool nccl = (it->second->transport == Pending::NCCL);
+      comms_list[comms_count++] = {i, reqs[i], nccl};
+      if (nccl) {
+        reqs[i] = MPI_REQUEST_NULL;
+        has_nccl = true;
+      }
     }
   }
   int err = rMPI_Waitall(n, reqs, stats);
+  if (has_nccl) {
+    gpuStreamSynchronize(s);
+  }
   for (std::size_t i = 0; i < comms_count; ++i) {
     const auto &e = comms_list[i];
     auto it = pending.find(e.r);
@@ -1025,21 +1229,23 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
       continue;
     }
     Pending *p = it->second;
-    if (stats && stats != MPI_STATUSES_IGNORE) {
-      const MPI_Status &st = stats[e.id];
-      if (st.MPI_ERROR != MPI_SUCCESS) {
-        pending.erase(it);
-        continue;
-      }
-      do_complete(p, const_cast<MPI_Status *>(&st));
+    if (e.is_nccl) {
+      do_complete(p, (stats && stats != MPI_STATUSES_IGNORE) ? &stats[e.id] : nullptr);
     } else {
-      // for MPI_IGNORES which have no stats
-      do_complete(p, nullptr);
+      if (stats && stats != MPI_STATUSES_IGNORE) {
+        const MPI_Status &st = stats[e.id];
+        if (st.MPI_ERROR != MPI_SUCCESS) {
+          pending.erase(it);
+          continue;
+        }
+        do_complete(p, const_cast<MPI_Status *>(&st));
+      } else {
+        do_complete(p, nullptr);
+      }
+      reqs[e.id] = MPI_REQUEST_NULL;
     }
     pending.erase(it);
-    reqs[e.id] = MPI_REQUEST_NULL;
   }
-  // Release pools now
   if (pending.empty()) {
     host_arena->release();
     dev_arena->release();
@@ -1049,7 +1255,9 @@ int MPI_Waitall(int n, MPI_Request reqs[], MPI_Status stats[]) {
 
 int MPI_Init(int *argc, char ***argv) {
   init();
-  return rMPI_Init(argc, argv);
+  int ret = rMPI_Init(argc, argv);
+  if (ret == MPI_SUCCESS) init_nccl();
+  return ret;
 }
 
 int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
@@ -1057,12 +1265,19 @@ int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
     FATAL("These hookds do not work with MPI_THREAD_MULTIPLE!");
   }
   init();
-  return rMPI_Init_thread(argc, argv, required, provided);
+  int ret = rMPI_Init_thread(argc, argv, required, provided);
+  if (ret == MPI_SUCCESS) init_nccl();
+  return ret;
 }
 
 // Kill time
 int MPI_Finalize(void) {
   init();
+  if (nccl_initialized) {
+    ncclCommDestroy(nccl_comm);
+    nccl_comm = nullptr;
+    nccl_initialized = false;
+  }
   free(host_arena->mem);
   gpuFree(dev_arena->mem);
   delete host_arena;
